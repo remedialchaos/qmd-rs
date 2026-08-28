@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Once;
 use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,6 +19,9 @@ use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use crate::error::{Error, Result};
+
+/// Ensures sqlite-vec is registered once before SQLite connections are opened.
+static SQLITE_VEC_EXTENSION: Once = Once::new();
 
 /// RFC 3339 UTC timestamp from system clock.
 fn now_rfc3339() -> String {
@@ -221,7 +225,8 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Self::init_connection(Connection::open(path)?)?;
+        Self::register_sqlite_vec();
+        let conn = Connection::open(path)?;
         let db = Self { conn, dims: None };
         db.migrate()?;
         Ok(db)
@@ -229,22 +234,23 @@ impl Db {
 
     /// Open an in-memory database (useful for tests).
     pub fn open_memory() -> Result<Self> {
-        let conn = Self::init_connection(Connection::open_in_memory()?)?;
+        Self::register_sqlite_vec();
+        let conn = Connection::open_in_memory()?;
         let db = Self { conn, dims: None };
         db.migrate()?;
         Ok(db)
     }
 
-    /// Register sqlite-vec extension and return the connection.
-    #[allow(clippy::unnecessary_wraps)]
-    fn init_connection(conn: Connection) -> Result<Connection> {
-        #[allow(unsafe_code, clippy::missing_transmute_annotations)]
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-        Ok(conn)
+    /// Register sqlite-vec before any SQLite connection is opened.
+    fn register_sqlite_vec() {
+        SQLITE_VEC_EXTENSION.call_once(|| {
+            #[allow(unsafe_code, clippy::missing_transmute_annotations)]
+            unsafe {
+                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                )));
+            }
+        });
     }
 
     /// Run schema migrations.
@@ -1065,6 +1071,16 @@ mod tests {
 
     fn mem_db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn test_sqlite_vec_extension_is_available() {
+        let db = mem_db();
+        let version: String = db
+            .conn
+            .query_row("SELECT vec_version()", [], |row| row.get(0))
+            .unwrap();
+        assert!(version.starts_with('v'));
     }
 
     #[test]
