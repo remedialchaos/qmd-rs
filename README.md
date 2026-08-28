@@ -13,6 +13,8 @@
 
 **Lightweight SOTA local search engine for AI agents in Rust — BM25 full-text search, vector semantic search, hybrid search with query expansion and reranking, plus an MCP server for AI tool integration.**
 
+> This fork tracks the Rust implementation of [qntx-labs/qmd](https://github.com/qntx-labs/qmd), originally authored by pyroth.sol. Its purpose is to keep this implementation live and updated.
+
 ## Crates
 
 | Crate | | Description |
