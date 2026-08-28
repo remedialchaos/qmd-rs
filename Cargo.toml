@@ -13,7 +13,8 @@ repository = "https://github.com/qntx/qmd"
 qmd = { version = "0.5", path = "qmd" }
 
 clap = { version = "4.6.0", features = ["derive"] }
-fastembed = "5.13"
+# Keep TLS in the Rust dependency graph rather than linking to system OpenSSL.
+fastembed = { version = "5.13", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
 ignore = "0.4"
 regex = "1.12.3"
 rusqlite = { version = "0.39", features = ["bundled", "functions"] }
