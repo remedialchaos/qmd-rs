@@ -10,8 +10,9 @@ env:
 
 jobs:
   call-publish:
-    uses: qntx/workflows/.github/workflows/rust-publish.yml@main
+    # Pinned to a verified immutable revision; upstream renamed this workflow.
+    uses: qntx/workflows/.github/workflows/rust-publish.yml@7b5fbf6c32e492a583b7f15e0b51d592e74f96e2
     with:
-      package: "qmd qmd-mcp qmd-cli"
+      package: "qmd qmd-cli"
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

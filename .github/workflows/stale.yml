@@ -7,4 +7,5 @@ on:
 
 jobs:
   close-stale:
-    uses: qntx/workflows/.github/workflows/stale.yml@main
+    # Pinned to a verified immutable revision; upstream removed this workflow.
+    uses: qntx/workflows/.github/workflows/stale.yml@7b5fbf6c32e492a583b7f15e0b51d592e74f96e2
