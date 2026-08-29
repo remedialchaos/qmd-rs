@@ -66,7 +66,8 @@ impl Chunker {
         let mut pos = 0;
 
         while pos < content.len() {
-            let target_end = (pos + self.max_chars).min(content.len());
+            let target_end =
+                floor_char_boundary(content, (pos + self.max_chars).min(content.len()));
             let mut end = target_end;
 
             if end < content.len()
@@ -78,7 +79,7 @@ impl Chunker {
             }
 
             if end <= pos {
-                end = (pos + self.max_chars).min(content.len());
+                end = next_char_boundary(content, pos);
             }
 
             chunks.push(Chunk {
@@ -90,7 +91,7 @@ impl Chunker {
                 break;
             }
 
-            let next = end.saturating_sub(self.overlap_chars);
+            let next = floor_char_boundary(content, end.saturating_sub(self.overlap_chars));
             pos = if chunks.last().is_some_and(|c| next <= c.pos) {
                 end
             } else {
@@ -100,6 +101,19 @@ impl Chunker {
 
         chunks
     }
+}
+
+/// Return the closest valid UTF-8 boundary at or before `index`.
+const fn floor_char_boundary(content: &str, mut index: usize) -> usize {
+    while index > 0 && !content.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Return the first valid UTF-8 boundary after `index`.
+fn next_char_boundary(content: &str, index: usize) -> usize {
+    index + content[index..].chars().next().map_or(0, char::len_utf8)
 }
 
 /// A scored break point position.
@@ -221,4 +235,19 @@ fn weighted_score(bp: &BreakPoint, target: usize, window: usize) -> f64 {
     let ratio = dist / w;
     let proximity = ratio.mul_add(-ratio, 1.0).max(0.0);
     f64::from(bp.score) * proximity
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Chunker;
+
+    #[test]
+    fn split_keeps_utf8_boundaries_when_no_break_point_is_available() {
+        let chunks = Chunker::new(4, 0).split("abc—def");
+
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.text).collect::<Vec<_>>(),
+            ["abc", "—d", "ef"]
+        );
+    }
 }
