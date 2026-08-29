@@ -7,7 +7,8 @@
     missing_docs
 )]
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -18,8 +19,8 @@ use qmd::{Collection, Qmd};
 #[command(name = "qmd", version, about)]
 struct Cli {
     /// Path to the SQLite index file.
-    #[arg(long, default_value = "index.sqlite")]
-    index: PathBuf,
+    #[arg(long)]
+    index: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -159,7 +160,15 @@ enum ContextAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = run(cli);
+    let index = resolve_index_path(cli.index.as_deref());
+    let result = (|| {
+        if cli.index.is_none()
+            && let Some(notice) = prepare_default_index(&index, Path::new("index.sqlite"))?
+        {
+            eprintln!("notice: {notice}");
+        }
+        run(&index, cli.command)
+    })();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -169,22 +178,64 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> qmd::Result<()> {
-    match cli.command {
-        Command::Collection { action } => cmd_collection(&cli.index, action),
-        Command::Update { collection } => cmd_update(&cli.index, &collection),
-        Command::Embed { force } => cmd_embed(&cli.index, force),
-        Command::Search { query, limit, json } => cmd_search(&cli.index, &query, limit, json),
-        Command::Fts { query, limit, json } => cmd_fts(&cli.index, &query, limit, json),
-        Command::Get { path, json } => cmd_get(&cli.index, &path, json),
-        Command::Status { json } => cmd_status(&cli.index, json),
-        Command::Context { action } => cmd_context(&cli.index, action),
-        Command::Cleanup => cmd_cleanup(&cli.index),
-        Command::Vacuum => cmd_vacuum(&cli.index),
+fn run(index: &Path, command: Command) -> qmd::Result<()> {
+    match command {
+        Command::Collection { action } => cmd_collection(index, action),
+        Command::Update { collection } => cmd_update(index, &collection),
+        Command::Embed { force } => cmd_embed(index, force),
+        Command::Search { query, limit, json } => cmd_search(index, &query, limit, json),
+        Command::Fts { query, limit, json } => cmd_fts(index, &query, limit, json),
+        Command::Get { path, json } => cmd_get(index, &path, json),
+        Command::Status { json } => cmd_status(index, json),
+        Command::Context { action } => cmd_context(index, action),
+        Command::Cleanup => cmd_cleanup(index),
+        Command::Vacuum => cmd_vacuum(index),
     }
 }
 
-fn cmd_collection(index: &PathBuf, action: CollectionAction) -> qmd::Result<()> {
+fn default_index_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    let data_home = xdg_data_home
+        .map_or_else(
+            || PathBuf::from(home.unwrap_or_else(|| OsStr::new("."))),
+            PathBuf::from,
+        )
+        .join(if xdg_data_home.is_some() {
+            "qmd"
+        } else {
+            ".local/share/qmd"
+        });
+    data_home.join("index.sqlite")
+}
+
+fn resolve_index_path(explicit: Option<&Path>) -> PathBuf {
+    explicit.map_or_else(
+        || {
+            default_index_path(
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
+        },
+        Path::to_path_buf,
+    )
+}
+
+fn prepare_default_index(new_index: &Path, legacy_index: &Path) -> qmd::Result<Option<String>> {
+    if let Some(parent) = new_index.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| qmd::Error::Config(format!("{}: {e}", parent.display())))?;
+    }
+    if legacy_index.is_file() && !new_index.exists() {
+        Ok(Some(format!(
+            "legacy index exists at {}; using new default at {} (legacy data was not moved)",
+            legacy_index.display(),
+            new_index.display()
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn cmd_collection(index: &Path, action: CollectionAction) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     match action {
         CollectionAction::Add {
@@ -225,7 +276,7 @@ fn cmd_collection(index: &PathBuf, action: CollectionAction) -> qmd::Result<()> 
     Ok(())
 }
 
-fn cmd_update(index: &PathBuf, collections: &[String]) -> qmd::Result<()> {
+fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     let filter: Option<Vec<&str>> = if collections.is_empty() {
         None
@@ -240,7 +291,7 @@ fn cmd_update(index: &PathBuf, collections: &[String]) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_embed(index: &PathBuf, force: bool) -> qmd::Result<()> {
+fn cmd_embed(index: &Path, force: bool) -> qmd::Result<()> {
     let mut qmd = Qmd::open(index)?;
     if force {
         qmd.clear_embeddings()?;
@@ -251,7 +302,7 @@ fn cmd_embed(index: &PathBuf, force: bool) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_search(index: &PathBuf, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
+fn cmd_search(index: &Path, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
     let mut qmd = Qmd::open(index)?;
     let results = qmd.search(query, limit)?;
     if json {
@@ -272,7 +323,7 @@ fn cmd_search(index: &PathBuf, query: &str, limit: usize, json: bool) -> qmd::Re
     Ok(())
 }
 
-fn cmd_fts(index: &PathBuf, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
+fn cmd_fts(index: &Path, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     let results = qmd.search_fts(query, limit)?;
     if json {
@@ -293,7 +344,7 @@ fn cmd_fts(index: &PathBuf, query: &str, limit: usize, json: bool) -> qmd::Resul
     Ok(())
 }
 
-fn cmd_get(index: &PathBuf, path: &str, json: bool) -> qmd::Result<()> {
+fn cmd_get(index: &Path, path: &str, json: bool) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     let doc = qmd.get(path)?;
     if json {
@@ -307,7 +358,7 @@ fn cmd_get(index: &PathBuf, path: &str, json: bool) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_status(index: &PathBuf, json: bool) -> qmd::Result<()> {
+fn cmd_status(index: &Path, json: bool) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     let s = qmd.status()?;
     if json {
@@ -332,7 +383,7 @@ fn cmd_status(index: &PathBuf, json: bool) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_context(index: &PathBuf, action: ContextAction) -> qmd::Result<()> {
+fn cmd_context(index: &Path, action: ContextAction) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     match action {
         ContextAction::Add {
@@ -392,16 +443,84 @@ fn cmd_context(index: &PathBuf, action: ContextAction) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_cleanup(index: &PathBuf) -> qmd::Result<()> {
+fn cmd_cleanup(index: &Path) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     let n = qmd.cleanup()?;
     println!("{n} items cleaned up");
     Ok(())
 }
 
-fn cmd_vacuum(index: &PathBuf) -> qmd::Result<()> {
+fn cmd_vacuum(index: &Path) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
     qmd.vacuum()?;
     println!("database vacuumed");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::fs;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("qmd-cli-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn default_path_uses_xdg_data_home() {
+        assert_eq!(
+            default_index_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/user"))),
+            PathBuf::from("/xdg/qmd/index.sqlite")
+        );
+    }
+
+    #[test]
+    fn default_path_falls_back_to_home_local_share() {
+        assert_eq!(
+            default_index_path(None, Some(OsStr::new("/home/user"))),
+            PathBuf::from("/home/user/.local/share/qmd/index.sqlite")
+        );
+    }
+
+    #[test]
+    fn explicit_index_is_preserved() {
+        let explicit = PathBuf::from("relative/custom.sqlite");
+        assert_eq!(resolve_index_path(Some(&explicit)), explicit);
+    }
+
+    #[test]
+    fn default_parent_is_created_and_legacy_notice_is_non_destructive() {
+        let temp = test_dir("legacy");
+        let legacy = temp.join("index.sqlite");
+        fs::create_dir_all(&temp).expect("tempdir");
+        fs::write(&legacy, b"legacy").expect("legacy index");
+        let new_index = temp.join("data/qmd/index.sqlite");
+
+        let notice = prepare_default_index(&new_index, &legacy).expect("prepare index");
+
+        assert!(new_index.parent().expect("parent").is_dir());
+        assert!(legacy.is_file());
+        assert!(!new_index.exists());
+        assert!(notice.is_some());
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn no_legacy_notice_when_new_default_exists() {
+        let temp = test_dir("new");
+        let legacy = temp.join("index.sqlite");
+        let new_index = temp.join("data/qmd/index.sqlite");
+        fs::create_dir_all(new_index.parent().expect("parent")).expect("parent");
+        fs::write(&legacy, b"legacy").expect("legacy index");
+        fs::write(&new_index, b"new").expect("new index");
+
+        assert!(
+            prepare_default_index(&new_index, &legacy)
+                .expect("prepare index")
+                .is_none()
+        );
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
 }

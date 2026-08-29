@@ -9,9 +9,107 @@ permissions:
   contents: write
 
 jobs:
-  call-cd:
-    # Pinned to a verified immutable revision; upstream renamed this workflow.
-    uses: qntx/workflows/.github/workflows/rust-cd.yml@7b5fbf6c32e492a583b7f15e0b51d592e74f96e2
-    with:
-      bin: qmd
-      package: qmd-cli
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # Major tags are used because immutable release SHAs were not independently verified.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Setup Linux ARM64 cross-compilation
+        if: matrix.cross
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release --package qmd-cli --target "${{ matrix.target }}"
+      - name: Package Unix artifact
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "${GITHUB_REF_NAME}" != v* ] && version="0.0.0-dev"
+          staging="qmd-$version-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/qmd" "$staging/"
+          cp LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar czf "$staging.tar.gz" -C "$staging" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$staging.tar.gz" > "$staging.tar.gz.sha256"
+          else
+            shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+          fi
+      - name: Package Windows artifact
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $staging = "qmd-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/qmd.exe", "LICENSE-MIT", "LICENSE-APACHE" $staging
+          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
+          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower() + "  $staging.zip" | Set-Content "$staging.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            qmd-*.*
+            !qmd-*/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      # Major tags are used because immutable release SHAs were not independently verified.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Generate changelog
+        id: cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --latest --strip header
+      - name: Publish GitHub release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.cliff.outputs.content }}
+          files: |
+            qmd-*.tar.gz
+            qmd-*.zip
+            qmd-*.sha256

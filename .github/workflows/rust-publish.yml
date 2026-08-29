@@ -2,17 +2,39 @@ name: Publish to crates.io
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    tags: ["v*.*.*"]
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
-  call-publish:
-    # Pinned to a verified immutable revision; upstream renamed this workflow.
-    uses: qntx/workflows/.github/workflows/rust-publish.yml@7b5fbf6c32e492a583b7f15e0b51d592e74f96e2
-    with:
-      package: "qmd qmd-cli"
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Major tags are used because immutable release SHAs were not independently verified.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate workspace and qmd package
+        run: |
+          cargo test --workspace --all-features
+          cargo publish --dry-run --package qmd
+      - name: Publish qmd
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package qmd
+      - name: Wait for qmd to reach crates.io
+        run: sleep 30
+      - name: Publish qmd-cli with propagation retry
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for attempt in 1 2 3; do
+            cargo publish --dry-run --package qmd-cli && cargo publish --package qmd-cli && exit 0
+            if [ "$attempt" -lt 3 ]; then
+              sleep 30
+            fi
+          done
+          exit 1

@@ -2,14 +2,22 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  call-ci:
-    # Pinned to a verified immutable revision; upstream renamed this workflow.
-    uses: qntx/workflows/.github/workflows/rust.yml@7b5fbf6c32e492a583b7f15e0b51d592e74f96e2
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions use major tags because their official immutable SHAs
+      # were not independently verified in this repository.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo test --workspace --all-features

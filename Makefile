@@ -1,8 +1,8 @@
 # Makefile for Rust project using Cargo
 
-.PHONY: all build check run test bench clippy clippy-fix fmt doc update
+.PHONY: all build check run test bench clippy clippy-fix fmt fmt-check doc update
 
-all: fmt clippy-fix
+all: fmt-check clippy
 
 # Build the project with all features enabled in release mode
 build:
@@ -49,6 +49,10 @@ clippy-fix:
 # Format the code using rustfmt with nightly toolchain
 fmt:
 	cargo +nightly fmt
+
+# Verify formatting without modifying files.
+fmt-check:
+	cargo fmt --check
 
 # Generate documentation for all crates and open it in the browser
 doc:
