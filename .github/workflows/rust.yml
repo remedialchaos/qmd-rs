@@ -22,3 +22,18 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace --all-features
+      - name: Smoke-test a fresh index through the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          docs="$work/docs"
+          index="$work/index.sqlite"
+          mkdir -p "$docs"
+          printf '# Smoke document\n\nneedleterm appears here.\n' > "$docs/smoke.md"
+          cargo run --quiet -p qmd-cli -- --index "$index" collection add "$docs" --name smoke
+          cargo run --quiet -p qmd-cli -- --index "$index" update
+          cargo run --quiet -p qmd-cli -- --index "$index" fts needleterm --json > "$work/results.json"
+          python3 -c 'import json, sys; rows=json.load(open(sys.argv[1])); assert len(rows) == 1, rows; assert rows[0]["doc"]["title"] == "Smoke document", rows' "$work/results.json"
+          test -f "$index"
