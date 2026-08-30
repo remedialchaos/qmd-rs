@@ -1,0 +1,22 @@
+name: RustSec advisory audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-29)
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Scan Cargo.lock for RustSec advisories
+        run: cargo audit --file Cargo.lock
