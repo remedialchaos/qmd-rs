@@ -18,10 +18,6 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// YAML serialization error.
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yml::Error),
-
     /// Embedding model error.
     #[error("embedding: {0}")]
     Embedding(String),
