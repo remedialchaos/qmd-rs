@@ -44,6 +44,9 @@ enum Command {
         /// Clear all embeddings first.
         #[arg(long)]
         force: bool,
+        /// Maximum number of documents to embed.
+        #[arg(long)]
+        batch: Option<usize>,
     },
     /// Hybrid search (FTS + vector + RRF + rerank).
     Search {
@@ -55,6 +58,9 @@ enum Command {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+        /// Number of matching results to skip.
+        #[arg(long, default_value = "0")]
+        offset: usize,
     },
     /// Full-text keyword search (BM25 only).
     Fts {
@@ -66,6 +72,9 @@ enum Command {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+        /// Number of matching results to skip.
+        #[arg(long, default_value = "0")]
+        offset: usize,
     },
     /// Get a document by collection/path or #docid.
     Get {
@@ -182,9 +191,19 @@ fn run(index: &Path, command: Command) -> qmd::Result<()> {
     match command {
         Command::Collection { action } => cmd_collection(index, action),
         Command::Update { collection } => cmd_update(index, &collection),
-        Command::Embed { force } => cmd_embed(index, force),
-        Command::Search { query, limit, json } => cmd_search(index, &query, limit, json),
-        Command::Fts { query, limit, json } => cmd_fts(index, &query, limit, json),
+        Command::Embed { force, batch } => cmd_embed(index, force, batch),
+        Command::Search {
+            query,
+            limit,
+            json,
+            offset,
+        } => cmd_search(index, &query, limit, offset, json),
+        Command::Fts {
+            query,
+            limit,
+            json,
+            offset,
+        } => cmd_fts(index, &query, limit, offset, json),
         Command::Get { path, json } => cmd_get(index, &path, json),
         Command::Status { json } => cmd_status(index, json),
         Command::Context { action } => cmd_context(index, action),
@@ -291,20 +310,32 @@ fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_embed(index: &Path, force: bool) -> qmd::Result<()> {
+fn cmd_embed(index: &Path, force: bool, batch: Option<usize>) -> qmd::Result<()> {
     let mut qmd = Qmd::open(index)?;
     if force {
         qmd.clear_embeddings()?;
         println!("cleared all embeddings");
     }
-    let r = qmd.embed()?;
-    println!("{} documents embedded, {} chunks", r.embedded, r.chunks);
+    let r = qmd.embed_with_batch(batch)?;
+    for message in &r.failure_messages {
+        eprintln!("{message}");
+    }
+    println!(
+        "{} documents embedded, {} chunks; {} remaining; {} failures",
+        r.embedded, r.chunks, r.remaining, r.failures
+    );
     Ok(())
 }
 
-fn cmd_search(index: &Path, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
+fn cmd_search(
+    index: &Path,
+    query: &str,
+    limit: usize,
+    offset: usize,
+    json: bool,
+) -> qmd::Result<()> {
     let mut qmd = Qmd::open(index)?;
-    let results = qmd.search(query, limit)?;
+    let results = qmd.search_with_offset(query, limit, offset)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {
@@ -323,9 +354,9 @@ fn cmd_search(index: &Path, query: &str, limit: usize, json: bool) -> qmd::Resul
     Ok(())
 }
 
-fn cmd_fts(index: &Path, query: &str, limit: usize, json: bool) -> qmd::Result<()> {
+fn cmd_fts(index: &Path, query: &str, limit: usize, offset: usize, json: bool) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
-    let results = qmd.search_fts(query, limit)?;
+    let results = qmd.search_fts_with_offset(query, limit, offset)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {

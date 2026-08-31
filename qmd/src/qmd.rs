@@ -247,34 +247,75 @@ impl Qmd {
 
     /// Generate embeddings for all documents that need them.
     pub fn embed(&mut self) -> Result<EmbedResult> {
-        let docs = self.db.unembedded_docs()?;
+        self.embed_with_batch(None)
+    }
+
+    /// Generate embeddings for up to `batch` documents.
+    pub fn embed_with_batch(&mut self, batch: Option<usize>) -> Result<EmbedResult> {
+        let docs = self.db.unembedded_docs_with_limit(batch)?;
         if docs.is_empty() {
             return Ok(EmbedResult {
                 embedded: 0,
                 chunks: 0,
+                remaining: self.db.needs_embedding_count()?,
+                failures: 0,
+                failure_messages: Vec::new(),
             });
         }
 
         self.ensure_embedder()?;
 
         let mut total_chunks = 0usize;
-        for (hash, _path, body) in &docs {
+        let mut embedded = 0usize;
+        let mut failures = 0usize;
+        let mut failure_messages = Vec::new();
+        for (hash, path, body) in &docs {
             let chunks = self.chunker.split(body);
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
-            let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
-            let embeddings = embedder.embed_documents(&texts)?;
+            let embed_result = self
+                .embedder
+                .as_mut()
+                .unwrap_or_else(|| unreachable!())
+                .embed_documents(&texts);
+            let Ok(embeddings) = embed_result else {
+                failures += 1;
+                failure_messages.push(format!("failed: {path}"));
+                continue;
+            };
 
-            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate() {
-                self.db
-                    .insert_embedding(hash, seq, chunk.pos, emb, "default")?;
+            let mut write_result = Ok(());
+            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate().skip(1) {
+                if let Err(e) = self
+                    .db
+                    .insert_embedding(hash, seq, chunk.pos, emb, "default")
+                {
+                    write_result = Err(e);
+                    break;
+                }
             }
+            if write_result.is_ok()
+                && let Some((chunk, emb)) = chunks.first().zip(embeddings.first())
+            {
+                write_result =
+                    self.db
+                        .insert_embedding(hash, 0, chunk.pos, emb, "default:complete");
+            }
+            if let Err(e) = write_result {
+                failures += 1;
+                failure_messages.push(format!("failed: {path}: {e}"));
+                continue;
+            }
+            embedded += 1;
             total_chunks += chunks.len();
         }
 
         Ok(EmbedResult {
-            embedded: docs.len(),
+            embedded,
             chunks: total_chunks,
+            remaining: self.db.needs_embedding_count()?,
+            failures,
+            failure_messages,
         })
     }
 
@@ -282,8 +323,19 @@ impl Qmd {
 
     /// Full-text search (BM25 only, no ML).
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_fts_with_offset(query, limit, 0)
+    }
+
+    /// Full-text search with offset pagination.
+    pub fn search_fts_with_offset(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
         let fts_query = search::build_fts5_query(query).unwrap_or_else(|| query.to_string());
-        self.db.search_fts(&fts_query, limit, None)
+        self.db
+            .search_fts_with_offset(&fts_query, limit, offset, None)
     }
 
     /// Vector similarity search.
@@ -298,8 +350,18 @@ impl Qmd {
     ///
     /// This is the recommended search method for best quality.
     pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_with_offset(query, limit, 0)
+    }
+
+    /// Hybrid search with offset pagination.
+    pub fn search_with_offset(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
         let queries = Query::expand_simple(query);
-        self.search_with_queries(query, &queries, limit)
+        self.search_with_queries_with_offset(query, &queries, limit, offset)
     }
 
     /// Search with pre-expanded queries (for external LLM integration).
@@ -309,7 +371,19 @@ impl Qmd {
         queries: &[Query],
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let fetch_limit = limit * 3;
+        self.search_with_queries_with_offset(query, queries, limit, 0)
+    }
+
+    /// Search with pre-expanded queries and offset pagination.
+    pub fn search_with_queries_with_offset(
+        &mut self,
+        query: &str,
+        queries: &[Query],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let requested = limit.saturating_add(offset);
+        let fetch_limit = requested.saturating_mul(3);
 
         let mut all_lists: Vec<Vec<String>> = Vec::new();
         let mut all_weights: Vec<f64> = Vec::new();
@@ -369,9 +443,13 @@ impl Qmd {
             .collect();
 
         if results.len() > 1 {
-            self.apply_reranking(query, &mut results, limit);
+            self.apply_reranking(query, &mut results, requested);
         }
 
+        if offset >= results.len() {
+            return Ok(Vec::new());
+        }
+        results.drain(..offset);
         results.truncate(limit);
         Ok(results)
     }
@@ -573,13 +651,19 @@ pub struct IndexResult {
 }
 
 /// Result of an embedding operation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EmbedResult {
     /// Documents embedded.
     pub embedded: usize,
     /// Total chunks processed.
     pub chunks: usize,
+    /// Documents still needing embedding after this run.
+    pub remaining: usize,
+    /// Documents that failed while embedding.
+    pub failures: usize,
+    /// Failure diagnostics for the CLI to display.
+    pub failure_messages: Vec<String>,
 }
 
 /// Directories excluded from indexing.

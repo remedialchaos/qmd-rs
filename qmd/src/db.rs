@@ -726,10 +726,21 @@ impl Db {
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let (coll_filter, limit_param) = if collection.is_some() {
-            ("AND d.collection = ?2", "?3")
+        self.search_fts_with_offset(fts_query, limit, 0, collection)
+    }
+
+    /// Full-text search with a deterministic offset for pagination.
+    pub fn search_fts_with_offset(
+        &self,
+        fts_query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let (coll_filter, limit_param, offset_param) = if collection.is_some() {
+            ("AND d.collection = ?2", "?3", "?4")
         } else {
-            ("", "?2")
+            ("", "?2", "?3")
         };
 
         let sql = format!(
@@ -740,7 +751,7 @@ impl Db {
               JOIN content c ON c.hash = d.hash
               WHERE documents_fts MATCH ?1 {coll_filter} AND d.active = 1
               ORDER BY score
-              LIMIT {limit_param}"
+              LIMIT {limit_param} OFFSET {offset_param}"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -763,10 +774,13 @@ impl Db {
         };
 
         let results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![fts_query, coll, limit as i64], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(
+                params![fts_query, coll, limit as i64, offset as i64],
+                map_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(params![fts_query, limit as i64], map_row)?
+            stmt.query_map(params![fts_query, limit as i64, offset as i64], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         Ok(results)
@@ -831,16 +845,34 @@ impl Db {
 
     /// Documents that need embedding.
     pub fn unembedded_docs(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        self.unembedded_docs_with_limit(None)
+    }
+
+    /// Documents that need embedding, optionally limited for a batch run.
+    pub fn unembedded_docs_with_limit(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String, String)>> {
+        let limit_clause = limit.map_or_else(String::new, |_| " LIMIT ?1".to_string());
+        let sql = format!(
             r"SELECT DISTINCT d.hash, d.path, c.doc
               FROM documents d
               JOIN content c ON c.hash = d.hash
-              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-              WHERE d.active = 1 AND v.hash IS NULL",
-        )?;
-        let results = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+              LEFT JOIN content_vectors v
+                ON d.hash = v.hash AND v.seq = 0 AND v.model = 'default:complete'
+              WHERE d.active = 1 AND v.hash IS NULL
+              ORDER BY d.id{limit_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mapper = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
+        let results = match limit {
+            Some(n) => stmt
+                .query_map(params![n as i64], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
         Ok(results)
     }
 
@@ -925,6 +957,7 @@ impl Db {
             r"SELECT COUNT(DISTINCT d.hash)
               FROM documents d
               LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+                AND v.model = 'default:complete'
               WHERE d.active = 1 AND v.hash IS NULL",
             [],
             |row| row.get::<_, i64>(0).map(|v| v as usize),
@@ -1312,6 +1345,73 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].doc.title, "Rust Ownership");
         assert_eq!(results[0].source, SearchSource::Fts);
+    }
+
+    #[test]
+    fn test_search_fts_offset_paginates() {
+        let db = mem_db();
+        for i in 0..25 {
+            let body = format!("Rust ownership document {i}");
+            let hash = hash_content(&body);
+            db.insert_content(&hash, &body).unwrap();
+            db.upsert_document("docs", &format!("{i}.md"), &body, &hash)
+                .unwrap();
+        }
+
+        let first = db.search_fts_with_offset("\"rust\"*", 10, 0, None).unwrap();
+        let second = db
+            .search_fts_with_offset("\"rust\"*", 10, 10, None)
+            .unwrap();
+        let third = db
+            .search_fts_with_offset("\"rust\"*", 10, 20, None)
+            .unwrap();
+        let beyond = db
+            .search_fts_with_offset("\"rust\"*", 10, 25, None)
+            .unwrap();
+
+        assert_eq!(first.len(), 10);
+        assert_eq!(second.len(), 10);
+        assert_eq!(third.len(), 5);
+        assert!(beyond.is_empty());
+        assert!(
+            first
+                .iter()
+                .map(|r| r.doc.path.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .is_disjoint(
+                    &second
+                        .iter()
+                        .map(|r| r.doc.path.as_str())
+                        .collect::<std::collections::HashSet<_>>()
+                )
+        );
+    }
+
+    #[test]
+    fn test_partial_embedding_with_seq_zero_is_still_unembedded() {
+        let mut db = mem_db();
+        let body = "A document with multiple chunks";
+        let hash = hash_content(body);
+        db.insert_content(&hash, body).unwrap();
+        db.upsert_document("docs", "partial.md", "Partial", &hash)
+            .unwrap();
+        db.insert_embedding(&hash, 0, 0, &[0.0_f32; 3], "default")
+            .unwrap();
+
+        assert_eq!(db.unembedded_docs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_unembedded_docs_respects_limit() {
+        let db = mem_db();
+        for i in 0..3 {
+            let body = format!("document {i}");
+            let hash = hash_content(&body);
+            db.insert_content(&hash, &body).unwrap();
+            db.upsert_document("docs", &format!("{i}.md"), "Doc", &hash)
+                .unwrap();
+        }
+        assert_eq!(db.unembedded_docs_with_limit(Some(2)).unwrap().len(), 2);
     }
 
     #[test]
