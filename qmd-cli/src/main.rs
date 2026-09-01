@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use qmd::{Collection, Qmd};
+use qmd::{Collection, DoctorCheckStatus, Qmd};
 
 /// QMD — local search engine for markdown files.
 #[derive(Parser)]
@@ -61,6 +61,9 @@ enum Command {
         /// Number of matching results to skip.
         #[arg(long, default_value = "0")]
         offset: usize,
+        /// Restrict results to this collection.
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Full-text keyword search (BM25 only).
     Fts {
@@ -75,6 +78,9 @@ enum Command {
         /// Number of matching results to skip.
         #[arg(long, default_value = "0")]
         offset: usize,
+        /// Restrict results to this collection.
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Get a document by collection/path or #docid.
     Get {
@@ -86,6 +92,12 @@ enum Command {
     },
     /// Show index status.
     Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run read-only index diagnostics.
+    Doctor {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -172,6 +184,7 @@ fn main() -> ExitCode {
     let index = resolve_index_path(cli.index.as_deref());
     let result = (|| {
         if cli.index.is_none()
+            && !matches!(&cli.command, Command::Doctor { .. })
             && let Some(notice) = prepare_default_index(&index, Path::new("index.sqlite"))?
         {
             eprintln!("notice: {notice}");
@@ -197,15 +210,18 @@ fn run(index: &Path, command: Command) -> qmd::Result<()> {
             limit,
             json,
             offset,
-        } => cmd_search(index, &query, limit, offset, json),
+            collection,
+        } => cmd_search(index, &query, limit, offset, collection.as_deref(), json),
         Command::Fts {
             query,
             limit,
             json,
             offset,
-        } => cmd_fts(index, &query, limit, offset, json),
+            collection,
+        } => cmd_fts(index, &query, limit, offset, collection.as_deref(), json),
         Command::Get { path, json } => cmd_get(index, &path, json),
         Command::Status { json } => cmd_status(index, json),
+        Command::Doctor { json } => cmd_doctor(index, json),
         Command::Context { action } => cmd_context(index, action),
         Command::Cleanup => cmd_cleanup(index),
         Command::Vacuum => cmd_vacuum(index),
@@ -307,6 +323,15 @@ fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
         "{} collections: {} indexed, {} updated, {} unchanged, {} removed",
         r.collections, r.indexed, r.updated, r.unchanged, r.removed
     );
+    for failure in &r.failures {
+        eprintln!("failed: {}: {}", failure.path, failure.reason);
+    }
+    if !r.failures.is_empty() {
+        return Err(qmd::Error::Config(format!(
+            "{} files failed during update",
+            r.failures.len()
+        )));
+    }
     Ok(())
 }
 
@@ -332,10 +357,11 @@ fn cmd_search(
     query: &str,
     limit: usize,
     offset: usize,
+    collection: Option<&str>,
     json: bool,
 ) -> qmd::Result<()> {
     let mut qmd = Qmd::open(index)?;
-    let results = qmd.search_with_offset(query, limit, offset)?;
+    let results = qmd.search_with_offset_in_collection(query, limit, offset, collection)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {
@@ -354,9 +380,16 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_fts(index: &Path, query: &str, limit: usize, offset: usize, json: bool) -> qmd::Result<()> {
+fn cmd_fts(
+    index: &Path,
+    query: &str,
+    limit: usize,
+    offset: usize,
+    collection: Option<&str>,
+    json: bool,
+) -> qmd::Result<()> {
     let qmd = Qmd::open(index)?;
-    let results = qmd.search_fts_with_offset(query, limit, offset)?;
+    let results = qmd.search_fts_with_offset_in_collection(query, limit, offset, collection)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {
@@ -410,6 +443,27 @@ fn cmd_status(index: &Path, json: bool) -> qmd::Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_doctor(index: &Path, json: bool) -> qmd::Result<()> {
+    let report = Qmd::doctor(index)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for check in &report.checks {
+            let status = match check.status {
+                DoctorCheckStatus::Ok => "ok",
+                DoctorCheckStatus::Warning => "warning",
+                DoctorCheckStatus::Error => "error",
+                _ => "unknown",
+            };
+            println!("{status:<7} {:<24} {}", check.name, check.detail);
+        }
+    }
+    if report.has_errors() {
+        return Err(qmd::Error::Config("doctor found index errors".into()));
     }
     Ok(())
 }

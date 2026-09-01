@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Once;
 use std::time::SystemTime;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
@@ -35,6 +35,47 @@ fn now_rfc3339() -> String {
     let min = (rem % 3600) / 60;
     let sec = rem % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Insert an embedding row using the supplied SQLite connection.
+fn insert_embedding_on_conn(
+    conn: &Connection,
+    hash: &str,
+    seq: usize,
+    pos: usize,
+    embedding: &[f32],
+    model: &str,
+) -> Result<()> {
+    let now = now_rfc3339();
+    let existing_rowid: Option<i64> = conn
+        .query_row(
+            "SELECT rowid FROM content_vectors WHERE hash = ?1 AND seq = ?2",
+            params![hash, seq as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let vec_bytes = embedding.as_bytes();
+    if let Some(rid) = existing_rowid {
+        conn.execute(
+            "UPDATE vec_embeddings SET embedding = ?1 WHERE rowid = ?2",
+            params![vec_bytes, rid],
+        )?;
+        conn.execute(
+            "UPDATE content_vectors SET pos = ?1, model = ?2, embedded_at = ?3 WHERE hash = ?4 AND seq = ?5",
+            params![pos as i64, model, now, hash, seq as i64],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO vec_embeddings (embedding) VALUES (?1)",
+            params![vec_bytes],
+        )?;
+        let rowid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO content_vectors (rowid, hash, seq, pos, model, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![rowid, hash, seq as i64, pos as i64, model, now],
+        )?;
+    }
+    Ok(())
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -206,8 +247,72 @@ pub struct IndexStatus {
     pub needs_embedding: usize,
     /// Whether a vector index exists.
     pub has_vector_index: bool,
+    /// Embedding contract fingerprint, if established.
+    pub embedding_fingerprint: Option<String>,
+    /// Compatibility between stored vectors and the active runtime contract.
+    pub embedding_compatibility: EmbeddingCompatibility,
     /// Per-collection info.
     pub collections: Vec<CollectionInfo>,
+}
+
+/// Compatibility state for stored embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EmbeddingCompatibility {
+    /// No vectors are stored.
+    NotPresent,
+    /// Vectors match the active embedding contract.
+    Compatible,
+    /// Legacy vectors exist without a persisted contract.
+    MissingLegacy,
+    /// Stored vectors were produced under a different contract.
+    Mismatched,
+    /// A low-level caller did not provide an active contract for comparison.
+    Unknown,
+}
+
+/// Severity of one read-only index diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum DoctorCheckStatus {
+    /// The check passed.
+    Ok,
+    /// The index is usable, but corrective action is recommended.
+    Warning,
+    /// The index is inconsistent or unsafe to use for the checked feature.
+    Error,
+}
+
+/// One stable, machine-readable diagnostic result.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct DoctorCheck {
+    /// Stable check identifier.
+    pub name: &'static str,
+    /// Check outcome.
+    pub status: DoctorCheckStatus,
+    /// Human-readable evidence and recovery guidance.
+    pub detail: String,
+}
+
+/// Complete read-only index diagnostic report.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct DoctorReport {
+    /// Checks in stable presentation order.
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    /// Whether any diagnostic reported an error.
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.status == DoctorCheckStatus::Error)
+    }
 }
 
 /// The database layer.
@@ -239,6 +344,13 @@ impl Db {
         let db = Self { conn, dims: None };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Open an existing index without migrations or write access.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::register_sqlite_vec();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn, dims: None })
     }
 
     /// Register sqlite-vec before any SQLite connection is opened.
@@ -750,7 +862,7 @@ impl Db {
               JOIN documents d ON d.id = fts.rowid
               JOIN content c ON c.hash = d.hash
               WHERE documents_fts MATCH ?1 {coll_filter} AND d.active = 1
-              ORDER BY score
+              ORDER BY score, d.collection, d.path, d.hash
               LIMIT {limit_param} OFFSET {offset_param}"
         );
 
@@ -794,53 +906,86 @@ impl Db {
     /// mapping in `content_vectors` from `(hash, seq)` → `rowid`.
     pub fn insert_embedding(
         &mut self,
+        _hash: &str,
+        _seq: usize,
+        _pos: usize,
+        _embedding: &[f32],
+        _model: &str,
+    ) -> Result<()> {
+        Err(Error::Config(
+            "embedding appends require the expected fingerprint; run qmd embed --force or use insert_embedding_with_fingerprint".into(),
+        ))
+    }
+
+    /// Append one embedding only when it matches the established contract.
+    pub fn insert_embedding_with_fingerprint(
+        &mut self,
         hash: &str,
         seq: usize,
         pos: usize,
         embedding: &[f32],
         model: &str,
+        expected_fingerprint: &str,
     ) -> Result<()> {
+        self.validate_embedding_fingerprint(expected_fingerprint)?;
         if self.dims.is_none() {
             self.dims = Some(embedding.len());
             self.ensure_vec_table(embedding.len())?;
+        } else if self.dims != Some(embedding.len()) {
+            return Err(Error::Config("embedding dimensions do not match".into()));
         }
-
-        let now = now_rfc3339();
-
-        let existing_rowid: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT rowid FROM content_vectors WHERE hash = ?1 AND seq = ?2",
-                params![hash, seq as i64],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let vec_bytes = embedding.as_bytes();
-
-        if let Some(rid) = existing_rowid {
-            self.conn.execute(
-                "UPDATE vec_embeddings SET embedding = ?1 WHERE rowid = ?2",
-                params![vec_bytes, rid],
-            )?;
-            self.conn.execute(
-                "UPDATE content_vectors SET pos = ?1, model = ?2, embedded_at = ?3 WHERE hash = ?4 AND seq = ?5",
-                params![pos as i64, model, now, hash, seq as i64],
-            )?;
-        } else {
-            self.conn.execute(
-                "INSERT INTO vec_embeddings (embedding) VALUES (?1)",
-                params![vec_bytes],
-            )?;
-            let rowid = self.conn.last_insert_rowid();
-            self.conn.execute(
-                r"INSERT INTO content_vectors (rowid, hash, seq, pos, model, embedded_at)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![rowid, hash, seq as i64, pos as i64, model, now],
-            )?;
-        }
-
+        let tx = self.conn.transaction()?;
+        insert_embedding_on_conn(&tx, hash, seq, pos, embedding, model)?;
+        tx.execute(
+            "INSERT INTO store_config(key, value) VALUES ('embedding_fingerprint', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![expected_fingerprint],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Replace/add a batch and publish its fingerprint in one transaction.
+    pub fn replace_embeddings_transactionally(
+        &mut self,
+        fingerprint: &str,
+        embeddings: &[(&str, usize, usize, Vec<f32>)],
+    ) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+        self.validate_embedding_fingerprint(fingerprint)?;
+        let dims = embeddings[0].3.len();
+        if embeddings.iter().any(|(_, _, _, e)| e.len() != dims) {
+            return Err(Error::Config("embedding dimensions do not match".into()));
+        }
+        if self.dims.is_none() {
+            self.dims = Some(dims);
+            self.ensure_vec_table(dims)?;
+        }
+        let tx = self.conn.transaction()?;
+        for (hash, seq, pos, embedding) in embeddings {
+            let model = if *seq == 0 {
+                "default:complete"
+            } else {
+                "default"
+            };
+            insert_embedding_on_conn(&tx, hash, *seq, *pos, embedding, model)?;
+        }
+        tx.execute(
+            "INSERT INTO store_config(key, value) VALUES ('embedding_fingerprint', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![fingerprint],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count stored embedding chunks.
+    pub fn vector_count(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })?)
     }
 
     /// Documents that need embedding.
@@ -877,15 +1022,31 @@ impl Db {
     }
 
     /// Vector similarity search using sqlite-vec native KNN.
+    ///
+    /// Callers must provide the embedding contract fingerprint when vectors exist.
     pub fn search_vec(
+        &self,
+        _query_embedding: &[f32],
+        _limit: usize,
+        _collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        if self.vector_count()? > 0 {
+            return Err(Error::Config(
+                "vector search requires the expected fingerprint; use search_vec_with_fingerprint or run qmd embed --force".into(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Vector search after validating the embedding contract.
+    pub fn search_vec_with_fingerprint(
         &self,
         query_embedding: &[f32],
         limit: usize,
         collection: Option<&str>,
+        expected_fingerprint: &str,
     ) -> Result<Vec<SearchResult>> {
-        if self.dims.is_none() {
-            return Ok(Vec::new());
-        }
+        self.validate_embedding_fingerprint(expected_fingerprint)?;
 
         let vec_bytes = query_embedding.as_bytes();
 
@@ -893,6 +1054,18 @@ impl Db {
             "AND d.collection = ?3"
         } else {
             ""
+        };
+
+        let knn_limit = if collection.is_some() {
+            let count: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))?;
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            count as usize
+        } else {
+            limit
         };
 
         let sql = format!(
@@ -905,7 +1078,7 @@ impl Db {
               WHERE ve.embedding MATCH ?1
                 AND k = ?2
                 {coll_filter}
-              ORDER BY ve.distance"
+              ORDER BY ve.distance, d.collection, d.path, d.hash"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -929,13 +1102,14 @@ impl Db {
             })
         };
 
-        let results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![vec_bytes, limit as i64, coll], map_row)?
+        let mut results: Vec<SearchResult> = if let Some(coll) = collection {
+            stmt.query_map(params![vec_bytes, knn_limit as i64, coll], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             stmt.query_map(params![vec_bytes, limit as i64], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
+        results.truncate(limit);
 
         Ok(results)
     }
@@ -966,6 +1140,16 @@ impl Db {
 
     /// Get full index status.
     pub fn status(&self) -> Result<IndexStatus> {
+        self.status_inner(None)
+    }
+
+    /// Get index status compared with the active embedding contract.
+    pub fn status_with_expected_fingerprint(&self, expected: &str) -> Result<IndexStatus> {
+        self.status_inner(Some(expected))
+    }
+
+    /// Build status with an optional active fingerprint comparison.
+    fn status_inner(&self, active_expected: Option<&str>) -> Result<IndexStatus> {
         let total = self.doc_count()?;
         let needs = self.needs_embedding_count()?;
         let has_vec: bool = self
@@ -997,15 +1181,247 @@ impl Db {
             });
         }
 
+        let embedding_fingerprint = self.embedding_fingerprint()?;
+        let embedding_compatibility = match (
+            self.vector_count()?,
+            embedding_fingerprint.as_deref(),
+            active_expected,
+        ) {
+            (0, _, _) => EmbeddingCompatibility::NotPresent,
+            (_, None, _) => EmbeddingCompatibility::MissingLegacy,
+            (_, Some(actual), Some(candidate)) if actual == candidate => {
+                EmbeddingCompatibility::Compatible
+            }
+            (_, Some(_), Some(_)) => EmbeddingCompatibility::Mismatched,
+            _ => EmbeddingCompatibility::Unknown,
+        };
         Ok(IndexStatus {
             total_documents: total,
             needs_embedding: needs,
             has_vector_index: has_vec,
+            embedding_fingerprint,
+            embedding_compatibility,
             collections: infos,
         })
     }
 
+    /// Run stable, read-only index diagnostics.
+    pub fn doctor(&self, expected_fingerprint: &str, expected_dims: usize) -> Result<DoctorReport> {
+        let mut checks = Vec::with_capacity(8);
+        let quick: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        checks.push(DoctorCheck {
+            name: "sqlite_quick_check",
+            status: if quick == "ok" {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Error
+            },
+            detail: quick,
+        });
+
+        let missing_fts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents d LEFT JOIN documents_fts f ON f.rowid = d.id WHERE d.active = 1 AND f.rowid IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let extra_fts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents_fts f LEFT JOIN documents d ON d.id = f.rowid AND d.active = 1 WHERE d.id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        checks.push(DoctorCheck {
+            name: "fts_documents",
+            status: if missing_fts == 0 && extra_fts == 0 {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Error
+            },
+            detail: format!("missing={missing_fts}, extra={extra_fts}"),
+        });
+
+        let orphan_content: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM content c WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash AND d.active = 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        checks.push(DoctorCheck {
+            name: "orphan_content",
+            status: if orphan_content == 0 {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Warning
+            },
+            detail: format!("{orphan_content} unreferenced content rows; run qmd cleanup"),
+        });
+
+        let orphan_vectors: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM content_vectors v WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = v.hash AND d.active = 1)",
+            [],
+            |row| row.get(0),
+        )?;
+        checks.push(DoctorCheck {
+            name: "orphan_vectors",
+            status: if orphan_vectors == 0 {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Error
+            },
+            detail: format!(
+                "{orphan_vectors} vector rows lack an active document; run qmd cleanup"
+            ),
+        });
+
+        let collections = self.list_collections()?;
+        let missing_paths: Vec<&str> = collections
+            .iter()
+            .filter(|collection| !Path::new(&collection.path).is_dir())
+            .map(|collection| collection.name.as_str())
+            .collect();
+        checks.push(DoctorCheck {
+            name: "collection_paths",
+            status: if missing_paths.is_empty() {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Warning
+            },
+            detail: if missing_paths.is_empty() {
+                format!(
+                    "{} registered collection paths are accessible",
+                    collections.len()
+                )
+            } else {
+                format!(
+                    "missing or unreadable collection paths: {}",
+                    missing_paths.join(", ")
+                )
+            },
+        });
+
+        let incomplete = self.needs_embedding_count()?;
+        checks.push(DoctorCheck {
+            name: "embedding_completeness",
+            status: if incomplete == 0 {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Warning
+            },
+            detail: format!("{incomplete} active documents need embedding; run qmd embed"),
+        });
+
+        let vector_count = self.vector_count()?;
+        let vec_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_embeddings'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        let stored_dims = if vector_count > 0 && vec_table {
+            self.conn
+                .query_row(
+                    "SELECT length(embedding) / 4 FROM vec_embeddings LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .map(|value| value as usize)
+        } else {
+            None
+        };
+        checks.push(DoctorCheck {
+            name: "vector_dimensions",
+            status: if vector_count == 0 || stored_dims == Some(expected_dims) {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Error
+            },
+            detail: if vector_count == 0 {
+                "no vectors stored".to_string()
+            } else if let Some(actual) = stored_dims {
+                format!("stored={actual}, expected={expected_dims}; run qmd embed --force")
+            } else {
+                "vector metadata exists but vec_embeddings is missing; run qmd embed --force"
+                    .to_string()
+            },
+        });
+
+        let stored_fingerprint = self.embedding_fingerprint()?;
+        checks.push(DoctorCheck {
+            name: "embedding_fingerprint",
+            status: match stored_fingerprint.as_deref() {
+                _ if vector_count == 0 => DoctorCheckStatus::Ok,
+                Some(actual) if actual == expected_fingerprint => DoctorCheckStatus::Ok,
+                _ => DoctorCheckStatus::Error,
+            },
+            detail: match stored_fingerprint {
+                _ if vector_count == 0 => "no vectors stored".to_string(),
+                Some(actual) if actual == expected_fingerprint => "compatible".to_string(),
+                Some(actual) => format!(
+                    "stored {actual}, expected {expected_fingerprint}; run qmd embed --force"
+                ),
+                None => "legacy vectors have no fingerprint; run qmd embed --force".to_string(),
+            },
+        });
+
+        Ok(DoctorReport { checks })
+    }
+
     // ── Maintenance ─────────────────────────────────────────────────────
+
+    /// Read the persisted embedding contract fingerprint, if established.
+    pub fn embedding_fingerprint(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM store_config WHERE key = 'embedding_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Establish the embedding contract only while no vectors exist.
+    ///
+    /// Once vectors exist, changing this value would relabel incompatible data.
+    /// Use [`Db::clear_embeddings`] before establishing a different fingerprint.
+    pub fn set_embedding_fingerprint(&self, fingerprint: &str) -> Result<()> {
+        if self.vector_count()? > 0 {
+            return match self.embedding_fingerprint()? {
+                Some(actual) if actual == fingerprint => Ok(()),
+                _ => Err(Error::Config(
+                    "cannot change the embedding fingerprint while existing vectors remain; run qmd embed --force"
+                        .into(),
+                )),
+            };
+        }
+        self.conn.execute(
+            "INSERT INTO store_config(key, value) VALUES ('embedding_fingerprint', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Reject vectors that were produced under another or unknown contract.
+    pub fn validate_embedding_fingerprint(&self, expected: &str) -> Result<()> {
+        let vectors: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))?;
+        match self.embedding_fingerprint()? {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(Error::Config(format!(
+                "embedding fingerprint mismatch (stored {actual}, expected {expected}); run qmd embed --force"
+            ))),
+            None if vectors > 0 => Err(Error::Config(
+                "legacy embeddings have no trustworthy fingerprint; run qmd embed --force".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    // ── Maintenance ────────────────────────────────────────────────────
 
     /// Delete inactive documents and orphaned content/vectors.
     pub fn cleanup(&self) -> Result<usize> {
@@ -1039,6 +1455,10 @@ impl Db {
     /// Clear all embeddings.
     pub fn clear_embeddings(&mut self) -> Result<usize> {
         let c = self.conn.execute("DELETE FROM content_vectors", [])?;
+        self.conn.execute(
+            "DELETE FROM store_config WHERE key = 'embedding_fingerprint'",
+            [],
+        )?;
         let _ = self.conn.execute("DROP TABLE IF EXISTS vec_embeddings", []);
         self.dims = None;
         Ok(c)
@@ -1395,8 +1815,15 @@ mod tests {
         db.insert_content(&hash, body).unwrap();
         db.upsert_document("docs", "partial.md", "Partial", &hash)
             .unwrap();
-        db.insert_embedding(&hash, 0, 0, &[0.0_f32; 3], "default")
-            .unwrap();
+        db.insert_embedding_with_fingerprint(
+            &hash,
+            0,
+            0,
+            &[0.0_f32; 3],
+            "default",
+            &crate::embed::embedding_fingerprint(3, 3200, 480),
+        )
+        .unwrap();
 
         assert_eq!(db.unembedded_docs().unwrap().len(), 1);
     }
@@ -1415,13 +1842,300 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_embedding_count() {
+    fn collection_filter_and_tie_pagination_are_stable() {
         let db = mem_db();
+        for (collection, path) in [("a", "z.md"), ("a", "a.md"), ("b", "b.md")] {
+            let body = "same rust text";
+            let hash = hash_content(&format!("{collection}/{path}"));
+            db.insert_content(&hash, body).unwrap();
+            db.upsert_document(collection, path, "same", &hash).unwrap();
+        }
+        let page = db
+            .search_fts_with_offset("\"rust\"*", 1, 0, Some("a"))
+            .unwrap();
+        let next = db
+            .search_fts_with_offset("\"rust\"*", 1, 1, Some("a"))
+            .unwrap();
+        assert_eq!(page[0].doc.collection, "a");
+        assert_eq!(next[0].doc.collection, "a");
+        assert_ne!(page[0].doc.path, next[0].doc.path);
+        assert_eq!(page[0].doc.path, "a.md");
+    }
 
-        let h = hash_content("some text");
-        db.insert_content(&h, "some text").unwrap();
-        db.upsert_document("c", "f.md", "F", &h).unwrap();
+    #[test]
+    fn collection_filter_covers_selected_hits_beyond_global_fetch_cap() {
+        let db = mem_db();
+        for i in 0..5 {
+            let body = "same rust text";
+            let hash = hash_content(&format!("other/{i}"));
+            db.insert_content(&hash, body).unwrap();
+            db.upsert_document("other", &format!("{i}.md"), "same", &hash)
+                .unwrap();
+        }
+        for i in 0..2 {
+            let body = "same rust text";
+            let hash = hash_content(&format!("selected/{i}"));
+            db.insert_content(&hash, body).unwrap();
+            db.upsert_document("selected", &format!("{i}.md"), "same", &hash)
+                .unwrap();
+        }
 
-        assert_eq!(db.needs_embedding_count().unwrap(), 1);
+        let all = db.search_fts_with_offset("\"rust\"*", 7, 0, Some("selected"));
+        assert_eq!(all.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn append_rejects_mismatched_embedding_fingerprint() {
+        let mut db = mem_db();
+        let expected = crate::embed::embedding_fingerprint(3, 3200, 480);
+        let other = crate::embed::embedding_fingerprint(4, 3200, 480);
+        db.set_embedding_fingerprint(&expected).unwrap();
+        let err = db
+            .insert_embedding_with_fingerprint("hash", 0, 0, &[0.0; 3], "default", &other)
+            .unwrap_err();
+        assert!(err.to_string().contains("fingerprint mismatch"));
+    }
+
+    #[test]
+    fn fresh_checked_append_publishes_fingerprint_atomically() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(3, 3200, 480);
+        db.insert_embedding_with_fingerprint("fresh", 0, 0, &[0.0; 3], "default", &fingerprint)
+            .unwrap();
+        assert_eq!(
+            db.embedding_fingerprint().unwrap().as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(db.vector_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn legacy_checked_append_is_rejected() {
+        let mut db = mem_db();
+        db.conn.execute(
+            "INSERT INTO content_vectors(hash, seq, pos, rowid, model, embedded_at) VALUES ('legacy', 0, 0, 1, 'default', 'legacy')",
+            [],
+        ).unwrap();
+        let err = db
+            .insert_embedding_with_fingerprint("new", 0, 0, &[0.0; 3], "default", "expected")
+            .unwrap_err();
+        assert!(err.to_string().contains("legacy embeddings"));
+    }
+
+    #[test]
+    fn ungated_vector_search_is_rejected_when_vectors_exist() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(3, 3200, 480);
+        db.insert_embedding_with_fingerprint("fresh", 0, 0, &[0.0; 3], "default", &fingerprint)
+            .unwrap();
+        let err = db.search_vec(&[0.0; 3], 1, None).unwrap_err();
+        assert!(err.to_string().contains("expected fingerprint"));
+    }
+
+    #[test]
+    fn gated_vector_search_rejects_mismatch() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(3, 3200, 480);
+        db.insert_embedding_with_fingerprint("fresh", 0, 0, &[0.0; 3], "default", &fingerprint)
+            .unwrap();
+        let err = db
+            .search_vec_with_fingerprint(&[0.0; 3], 1, None, "other")
+            .unwrap_err();
+        assert!(err.to_string().contains("fingerprint mismatch"));
+    }
+
+    #[test]
+    fn transactional_embedding_failure_does_not_publish_fingerprint() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(3, 3200, 480);
+        let err = db
+            .replace_embeddings_transactionally(
+                &fingerprint,
+                &[("hash", 0, 0, vec![0.0; 3]), ("hash", 1, 1, vec![0.0; 2])],
+            )
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(db.embedding_fingerprint().unwrap(), None);
+        assert_eq!(db.vector_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn collection_vector_knn_cap_does_not_hide_selected_hits() {
+        let mut db = mem_db();
+        db.upsert_collection(&Collection::new("other", "/tmp/other"))
+            .unwrap();
+        db.upsert_collection(&Collection::new("selected", "/tmp/selected"))
+            .unwrap();
+        let other_hash = hash_content("other");
+        let selected_hash = hash_content("selected");
+        for (collection, path, hash) in [
+            ("other", "near.md", &other_hash),
+            ("selected", "far.md", &selected_hash),
+        ] {
+            db.insert_content(hash, collection).unwrap();
+            db.upsert_document(collection, path, path, hash).unwrap();
+        }
+        let fingerprint = crate::embed::embedding_fingerprint(3, 3200, 480);
+        db.insert_embedding_with_fingerprint(
+            &other_hash,
+            0,
+            0,
+            &[0.0, 0.0, 0.0],
+            "default",
+            &fingerprint,
+        )
+        .unwrap();
+        db.insert_embedding_with_fingerprint(
+            &selected_hash,
+            0,
+            0,
+            &[1.0, 0.0, 0.0],
+            "default",
+            &fingerprint,
+        )
+        .unwrap();
+
+        let hits = db
+            .search_vec_with_fingerprint(&[0.0, 0.0, 0.0], 1, Some("selected"), &fingerprint)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc.collection, "selected");
+    }
+
+    #[test]
+    fn status_exposes_embedding_fingerprint_state() {
+        let mut db = mem_db();
+        assert_eq!(db.status().unwrap().embedding_fingerprint, None);
+        let fingerprint = crate::embed::embedding_fingerprint(3, 100, 10);
+        db.insert_embedding_with_fingerprint("fresh", 0, 0, &[0.0; 3], "default", &fingerprint)
+            .unwrap();
+        assert_eq!(
+            db.status().unwrap().embedding_fingerprint,
+            Some(fingerprint)
+        );
+    }
+
+    #[test]
+    fn status_json_reports_fingerprint_compatibility_states() {
+        let mut db = mem_db();
+        let expected = crate::embed::embedding_fingerprint(3, 100, 10);
+        assert_eq!(
+            db.status_with_expected_fingerprint(&expected)
+                .unwrap()
+                .embedding_compatibility,
+            EmbeddingCompatibility::NotPresent
+        );
+        db.insert_embedding_with_fingerprint("fresh", 0, 0, &[0.0; 3], "default", &expected)
+            .unwrap();
+        assert_eq!(
+            db.status_with_expected_fingerprint(&expected)
+                .unwrap()
+                .embedding_compatibility,
+            EmbeddingCompatibility::Compatible
+        );
+        assert_eq!(
+            db.status_with_expected_fingerprint("other")
+                .unwrap()
+                .embedding_compatibility,
+            EmbeddingCompatibility::Mismatched
+        );
+        let json =
+            serde_json::to_value(db.status_with_expected_fingerprint("other").unwrap()).unwrap();
+        assert_eq!(json["embedding_compatibility"], "mismatched");
+    }
+    #[test]
+    fn fingerprint_is_deterministic_and_persisted() {
+        let db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(384, 3200, 480);
+        assert_eq!(
+            fingerprint,
+            crate::embed::embedding_fingerprint(384, 3200, 480)
+        );
+        assert_ne!(
+            fingerprint,
+            crate::embed::embedding_fingerprint(385, 3200, 480)
+        );
+        assert_eq!(db.embedding_fingerprint().unwrap(), None);
+        db.set_embedding_fingerprint(&fingerprint).unwrap();
+        assert_eq!(db.embedding_fingerprint().unwrap(), Some(fingerprint));
+    }
+
+    #[test]
+    fn collection_vector_search_filters_before_limit_and_preserves_limit() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        for (collection, path, vector) in [
+            ("other", "nearest.md", [1.0, 0.0]),
+            ("selected", "first.md", [0.9, 0.1]),
+            ("selected", "second.md", [0.8, 0.2]),
+        ] {
+            let body = format!("{collection}/{path}");
+            let hash = hash_content(&body);
+            db.insert_content(&hash, &body).unwrap();
+            db.upsert_document(collection, path, path, &hash).unwrap();
+            db.insert_embedding_with_fingerprint(&hash, 0, 0, &vector, "default", &fingerprint)
+                .unwrap();
+        }
+
+        let hits = db
+            .search_vec_with_fingerprint(&[1.0, 0.0], 1, Some("selected"), &fingerprint)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc.collection, "selected");
+        assert_eq!(hits[0].doc.path, "first.md");
+    }
+
+    #[test]
+    fn established_fingerprint_cannot_be_reassigned_over_vectors() {
+        let mut db = mem_db();
+        db.insert_embedding_with_fingerprint("hash", 0, 0, &[1.0, 0.0], "default", "A")
+            .unwrap();
+
+        let err = db.set_embedding_fingerprint("B").unwrap_err();
+        assert!(err.to_string().contains("existing vectors"));
+        assert_eq!(db.embedding_fingerprint().unwrap().as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn doctor_reports_stable_warning_and_error_states() {
+        let healthy = mem_db().doctor("expected", 384).unwrap();
+        assert!(
+            healthy
+                .checks
+                .iter()
+                .all(|check| check.status == DoctorCheckStatus::Ok)
+        );
+
+        let warning_only = mem_db();
+        warning_only
+            .upsert_collection(&Collection::new("missing", "/definitely/not/here"))
+            .unwrap();
+        let warning_report = warning_only.doctor("expected", 384).unwrap();
+        assert!(!warning_report.has_errors());
+        assert!(warning_report.checks.iter().any(|check| {
+            check.name == "collection_paths" && check.status == DoctorCheckStatus::Warning
+        }));
+
+        let db = mem_db();
+        db.upsert_collection(&Collection::new("missing", "/definitely/not/here"))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO content_vectors(hash, seq, pos, model, embedded_at) VALUES ('orphan', 0, 0, 'legacy', 'now')",
+                [],
+            )
+            .unwrap();
+
+        let report = db.doctor("expected", 384).unwrap();
+        assert!(report.checks.iter().any(|check| {
+            check.name == "collection_paths" && check.status == DoctorCheckStatus::Warning
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "orphan_vectors" && check.status == DoctorCheckStatus::Error
+        }));
+        assert!(report.has_errors());
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["checks"].is_array());
+        assert_eq!(json["checks"][0]["name"], "sqlite_quick_check");
     }
 }

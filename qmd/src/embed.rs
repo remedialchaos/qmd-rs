@@ -1,11 +1,40 @@
 //! Embedding engine backed by [`fastembed`].
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use sha2::{Digest, Sha256};
+
+use crate::chunk::{Chunker, DEFAULT_CHUNK_CHARS, DEFAULT_OVERLAP_CHARS};
 
 use crate::error::{Error, Result};
 
 /// Upper bound for the number of chunks embedded in one ONNX Runtime call.
 const EMBEDDING_BATCH_SIZE: usize = 16;
+
+/// Stable fingerprint format for the embedding/index contract.
+pub const FINGERPRINT_FORMAT: &str = "qmd-embedding-v1";
+
+/// Build the deterministic fingerprint for the current embedding contract.
+#[must_use]
+pub fn embedding_fingerprint(dims: usize, max_chars: usize, overlap_chars: usize) -> String {
+    let input = format!(
+        "{FINGERPRINT_FORMAT}|model=AllMiniLML6V2|dims={dims}|max_chars={max_chars}|overlap_chars={overlap_chars}"
+    );
+    let mut hash = Sha256::new();
+    hash.update(input.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+/// Fingerprint for the default embedder and chunker.
+#[must_use]
+pub fn default_embedding_fingerprint(dims: usize) -> String {
+    embedding_fingerprint(dims, DEFAULT_CHUNK_CHARS, DEFAULT_OVERLAP_CHARS)
+}
+
+/// Fingerprint for a specific embedding chunker configuration.
+#[must_use]
+pub fn default_embedding_fingerprint_with_chunker(dims: usize, chunker: Chunker) -> String {
+    embedding_fingerprint(dims, chunker.max_chars, chunker.overlap_chars)
+}
 
 /// Return contiguous ranges that limit a document embedding request to safe batches.
 fn batch_ranges(len: usize) -> Vec<std::ops::Range<usize>> {

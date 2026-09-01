@@ -1,0 +1,23 @@
+[
+  {
+    "query": "rust ownership borrowing",
+    "relevance": {
+      "quality/rust.md": 3,
+      "quality/borrow.md": 2
+    }
+  },
+  {
+    "query": "sqlite fts5 full text search",
+    "relevance": {
+      "quality/sqlite.md": 3,
+      "quality/ranking.md": 1
+    }
+  },
+  {
+    "query": "bm25 relevance ranking",
+    "relevance": {
+      "quality/ranking.md": 3,
+      "quality/sqlite.md": 2
+    }
+  }
+]

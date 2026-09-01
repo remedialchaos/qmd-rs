@@ -30,8 +30,9 @@ pub mod rerank;
 pub mod search;
 
 pub use db::{
-    Collection, CollectionInfo, Document, IndexStatus, SearchResult, SearchSource, hash_content,
+    Collection, CollectionInfo, DoctorCheck, DoctorCheckStatus, DoctorReport, Document,
+    EmbeddingCompatibility, IndexStatus, SearchResult, SearchSource, hash_content,
 };
 pub use error::{Error, Result};
-pub use qmd::{EmbedResult, IndexResult, Qmd, UpdateResult};
+pub use qmd::{EmbedResult, IndexFailure, IndexResult, Qmd, UpdateResult};
 pub use search::{Query, QueryType};

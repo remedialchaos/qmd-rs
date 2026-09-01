@@ -271,7 +271,7 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
             score,
         })
         .collect();
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
     hits
 }
 

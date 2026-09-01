@@ -79,6 +79,7 @@ qmd search "local search engine for AI"
 # Page through results, or emit JSON
 qmd search "indexing" --offset 10
 qmd fts "bm25" --json
+qmd search "indexing" --collection my-docs
 
 # Get a document by collection/path or by #docid
 qmd get my-docs/meeting-notes.md
@@ -86,6 +87,10 @@ qmd get "#a1b2c3"
 
 # Show index status
 qmd status
+
+# Run read-only index diagnostics (also available as JSON)
+qmd doctor
+qmd doctor --json
 
 # Attach context text to a collection path or globally
 qmd context add my-docs /api "Internal API documentation"
@@ -105,6 +110,16 @@ work against a specific index file instead of the default location:
 
 ```bash
 qmd --index ~/indexes/docs.db status
+```
+
+## Retrieval-quality regression gate
+
+The repository includes a small checked-in corpus and relevance judgments. The
+gate exercises real FTS indexing, computes MRR, Recall@3, and nDCG@3, and checks
+deterministic fusion without downloading a model:
+
+```bash
+cargo test -p qmd --test retrieval_quality
 ```
 
 ## License

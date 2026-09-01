@@ -18,10 +18,10 @@ use ignore::WalkBuilder;
 
 use crate::chunk::Chunker;
 use crate::db::{
-    Collection, CollectionInfo, Db, Document, IndexStatus, SearchResult, extract_title,
-    hash_content,
+    Collection, CollectionInfo, Db, DoctorReport, Document, IndexStatus, SearchResult,
+    extract_title, hash_content,
 };
-use crate::embed::Embedder;
+use crate::embed::{Embedder, default_embedding_fingerprint_with_chunker};
 use crate::error::{Error, Result};
 use crate::rerank::Reranker;
 use crate::search::{self, Query, QueryType};
@@ -80,6 +80,11 @@ impl Qmd {
     /// Set a custom chunker.
     pub const fn set_chunker(&mut self, chunker: Chunker) {
         self.chunker = chunker;
+    }
+
+    /// Return the fingerprint for this Qmd handle's active embedding contract.
+    fn current_embedding_fingerprint(&self) -> String {
+        default_embedding_fingerprint_with_chunker(384, self.chunker)
     }
 
     /// Ensure the embedder is loaded, lazily initializing on first call.
@@ -165,6 +170,7 @@ impl Qmd {
             total.updated += r.updated;
             total.unchanged += r.unchanged;
             total.removed += r.removed;
+            total.failures.extend(r.failures);
             total.collections += 1;
         }
 
@@ -186,6 +192,7 @@ impl Qmd {
         let mut indexed = 0usize;
         let mut updated = 0usize;
         let mut unchanged = 0usize;
+        let mut failures = Vec::new();
 
         for file_path in &files {
             let rel = file_path
@@ -194,8 +201,15 @@ impl Qmd {
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            let Ok(content) = std::fs::read_to_string(file_path) else {
-                continue;
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(content) => content,
+                Err(error) => {
+                    failures.push(IndexFailure {
+                        path: file_path.display().to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
             };
             if content.trim().is_empty() {
                 continue;
@@ -240,6 +254,7 @@ impl Qmd {
             updated,
             unchanged,
             removed,
+            failures,
         })
     }
 
@@ -252,6 +267,8 @@ impl Qmd {
 
     /// Generate embeddings for up to `batch` documents.
     pub fn embed_with_batch(&mut self, batch: Option<usize>) -> Result<EmbedResult> {
+        let fingerprint = self.current_embedding_fingerprint();
+        self.db.validate_embedding_fingerprint(&fingerprint)?;
         let docs = self.db.unembedded_docs_with_limit(batch)?;
         if docs.is_empty() {
             return Ok(EmbedResult {
@@ -266,13 +283,13 @@ impl Qmd {
         self.ensure_embedder()?;
 
         let mut total_chunks = 0usize;
-        let mut embedded = 0usize;
         let mut failures = 0usize;
         let mut failure_messages = Vec::new();
+        let mut pending = Vec::new();
+        let mut successful_docs = 0usize;
         for (hash, path, body) in &docs {
             let chunks = self.chunker.split(body);
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-
             let embed_result = self
                 .embedder
                 .as_mut()
@@ -283,38 +300,29 @@ impl Qmd {
                 failure_messages.push(format!("failed: {path}"));
                 continue;
             };
-
-            let mut write_result = Ok(());
-            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings.iter()).enumerate().skip(1) {
-                if let Err(e) = self
-                    .db
-                    .insert_embedding(hash, seq, chunk.pos, emb, "default")
-                {
-                    write_result = Err(e);
-                    break;
-                }
+            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
+                pending.push((hash.as_str(), seq, chunk.pos, emb));
             }
-            if write_result.is_ok()
-                && let Some((chunk, emb)) = chunks.first().zip(embeddings.first())
-            {
-                write_result =
-                    self.db
-                        .insert_embedding(hash, 0, chunk.pos, emb, "default:complete");
-            }
-            if let Err(e) = write_result {
-                failures += 1;
-                failure_messages.push(format!("failed: {path}: {e}"));
-                continue;
-            }
-            embedded += 1;
+            successful_docs += 1;
             total_chunks += chunks.len();
         }
 
+        if failures > 0 {
+            return Ok(EmbedResult {
+                embedded: 0,
+                chunks: 0,
+                remaining: self.db.needs_embedding_count()?,
+                failures,
+                failure_messages,
+            });
+        }
+        self.db
+            .replace_embeddings_transactionally(&fingerprint, &pending)?;
         Ok(EmbedResult {
-            embedded,
+            embedded: successful_docs,
             chunks: total_chunks,
             remaining: self.db.needs_embedding_count()?,
-            failures,
+            failures: 0,
             failure_messages,
         })
     }
@@ -333,17 +341,31 @@ impl Qmd {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchResult>> {
+        self.search_fts_with_offset_in_collection(query, limit, offset, None)
+    }
+
+    /// Full-text search with offset pagination restricted to one collection.
+    pub fn search_fts_with_offset_in_collection(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let fts_query = search::build_fts5_query(query).unwrap_or_else(|| query.to_string());
         self.db
-            .search_fts_with_offset(&fts_query, limit, offset, None)
+            .search_fts_with_offset(&fts_query, limit, offset, collection)
     }
 
     /// Vector similarity search.
     pub fn search_vec(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let fingerprint = self.current_embedding_fingerprint();
+        self.db.validate_embedding_fingerprint(&fingerprint)?;
         self.ensure_embedder()?;
         let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
         let emb = embedder.embed_query(query)?;
-        self.db.search_vec(&emb, limit, None)
+        self.db
+            .search_vec_with_fingerprint(&emb, limit, None, &fingerprint)
     }
 
     /// Hybrid search: FTS + vector + RRF fusion + optional reranking.
@@ -361,7 +383,21 @@ impl Qmd {
         offset: usize,
     ) -> Result<Vec<SearchResult>> {
         let queries = Query::expand_simple(query);
-        self.search_with_queries_with_offset(query, &queries, limit, offset)
+        self.search_with_queries_with_offset_in_collection(query, &queries, limit, offset, None)
+    }
+
+    /// Hybrid search with offset pagination restricted to one collection.
+    pub fn search_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let queries = Query::expand_simple(query);
+        self.search_with_queries_with_offset_in_collection(
+            query, &queries, limit, offset, collection,
+        )
     }
 
     /// Search with pre-expanded queries (for external LLM integration).
@@ -382,6 +418,20 @@ impl Qmd {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchResult>> {
+        self.search_with_queries_with_offset_in_collection(query, queries, limit, offset, None)
+    }
+
+    /// Search with pre-expanded queries and collection-scoped pagination.
+    pub fn search_with_queries_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        queries: &[Query],
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let fingerprint = self.current_embedding_fingerprint();
+        self.db.validate_embedding_fingerprint(&fingerprint)?;
         let requested = limit.saturating_add(offset);
         let fetch_limit = requested.saturating_mul(3);
 
@@ -390,7 +440,7 @@ impl Qmd {
         let mut result_map: HashMap<String, SearchResult> = HashMap::new();
 
         if let Some(fts_q) = search::build_fts5_query(query)
-            && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, None)
+            && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, collection)
         {
             collect_results(&mut all_lists, &mut all_weights, &mut result_map, hits, 1.0);
         }
@@ -401,7 +451,7 @@ impl Qmd {
             match q.kind {
                 QueryType::Lex => {
                     if let Some(fts_q) = search::build_fts5_query(&q.text)
-                        && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, None)
+                        && let Ok(hits) = self.db.search_fts(&fts_q, fetch_limit, collection)
                     {
                         collect_results(
                             &mut all_lists,
@@ -415,7 +465,12 @@ impl Qmd {
                 QueryType::Vec | QueryType::Hyde => {
                     let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
                     if let Ok(emb) = embedder.embed_query(&q.text)
-                        && let Ok(hits) = self.db.search_vec(&emb, fetch_limit, None)
+                        && let Ok(hits) = self.db.search_vec_with_fingerprint(
+                            &emb,
+                            fetch_limit,
+                            collection,
+                            &fingerprint,
+                        )
                     {
                         collect_results(
                             &mut all_lists,
@@ -499,6 +554,7 @@ impl Qmd {
                 reranked.push(r.clone());
             }
         }
+        sort_results_stably(&mut reranked);
         *results = reranked;
     }
 
@@ -527,7 +583,15 @@ impl Qmd {
 
     /// Get full index status.
     pub fn status(&self) -> Result<IndexStatus> {
-        self.db.status()
+        self.db
+            .status_with_expected_fingerprint(&self.current_embedding_fingerprint())
+    }
+
+    /// Diagnose an existing index through a strictly read-only connection.
+    pub fn doctor(db_path: impl AsRef<Path>) -> Result<DoctorReport> {
+        let db = Db::open_read_only(db_path.as_ref())?;
+        let fingerprint = default_embedding_fingerprint_with_chunker(384, Chunker::default());
+        db.doctor(&fingerprint, 384)
     }
 
     /// Count active documents.
@@ -556,6 +620,16 @@ impl Qmd {
     pub fn vacuum(&self) -> Result<()> {
         self.db.vacuum()
     }
+}
+
+/// Apply the total order used after fusion and reranking.
+fn sort_results_stably(results: &mut [SearchResult]) {
+    results.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc.display_path().cmp(&b.doc.display_path()))
+            .then_with(|| a.doc.hash.cmp(&b.doc.hash))
+    });
 }
 
 /// Walk a collection directory using the `ignore` crate (gitignore-aware).
@@ -620,8 +694,100 @@ fn collect_results(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::{Qmd, sort_results_stably};
+    use crate::chunk::Chunker;
+    use crate::db::{Document, SearchResult, SearchSource};
+    use crate::embed::embedding_fingerprint;
+
+    #[test]
+    fn custom_chunker_changes_active_embedding_fingerprint() {
+        let mut qmd = Qmd::open_memory().expect("in-memory qmd should open");
+        qmd.set_chunker(Chunker::new(100, 10));
+        assert_eq!(
+            qmd.current_embedding_fingerprint(),
+            embedding_fingerprint(384, 100, 10)
+        );
+    }
+
+    #[test]
+    fn update_keeps_successes_and_reports_file_failures() {
+        use crate::db::Collection;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "qmd-partial-update-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("good.md"), "# good\nsearchable text").unwrap();
+        fs::write(root.join("bad.md"), [0xff, 0xfe]).unwrap();
+
+        let qmd = Qmd::open_memory().unwrap();
+        qmd.register_collection(&Collection::new("docs", root.to_string_lossy()))
+            .unwrap();
+        let result = qmd.update(None).unwrap();
+
+        assert_eq!(result.indexed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].path.ends_with("bad.md"));
+        assert!(!result.failures[0].reason.is_empty());
+        assert_eq!(qmd.doc_count().unwrap(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reranked_score_ties_use_stable_document_identity() {
+        let make_result = |collection: &str, path: &str| SearchResult {
+            doc: Document {
+                collection: collection.into(),
+                path: path.into(),
+                title: path.into(),
+                hash: format!("{collection}-{path}"),
+                modified_at: String::new(),
+                body_len: 0,
+                body: None,
+            },
+            score: 1.0,
+            source: SearchSource::Fts,
+        };
+        let mut results = vec![
+            make_result("b", "same.md"),
+            make_result("a", "z.md"),
+            make_result("a", "a.md"),
+        ];
+        sort_results_stably(&mut results);
+        let paths: Vec<String> = results.iter().map(|hit| hit.doc.display_path()).collect();
+        assert_eq!(paths, ["a/a.md", "a/z.md", "b/same.md"]);
+    }
+
+    #[test]
+    fn doctor_does_not_modify_the_index_file() {
+        use std::fs;
+
+        let path = std::env::temp_dir().join(format!(
+            "qmd-doctor-read-only-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let _qmd = Qmd::open(&path).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let report = Qmd::doctor(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert!(!report.has_errors());
+        assert_eq!(before, after);
+        fs::remove_file(path).unwrap();
+    }
+}
+
 /// Result of an [`update`](Qmd::update) operation across collections.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct UpdateResult {
     /// Number of collections processed.
@@ -634,10 +800,22 @@ pub struct UpdateResult {
     pub unchanged: usize,
     /// Removed (deactivated) documents.
     pub removed: usize,
+    /// Files that failed while successful files remained indexed.
+    pub failures: Vec<IndexFailure>,
+}
+
+/// Structured per-file indexing failure.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct IndexFailure {
+    /// Actionable source path.
+    pub path: String,
+    /// Underlying failure reason.
+    pub reason: String,
 }
 
 /// Result of indexing a single collection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct IndexResult {
     /// Newly indexed documents.
@@ -648,6 +826,8 @@ pub struct IndexResult {
     pub unchanged: usize,
     /// Removed (deactivated) documents.
     pub removed: usize,
+    /// Files that failed while successful files remained indexed.
+    pub failures: Vec<IndexFailure>,
 }
 
 /// Result of an embedding operation.
