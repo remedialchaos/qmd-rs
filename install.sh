@@ -8,7 +8,8 @@
 
 set -eu
 
-REPO="qntx-labs/qmd"
+# Fork of the qntx-labs/qmd installer; releases are published from remedialchaos/qmd-rs.
+REPO="remedialchaos/qmd-rs"
 BIN="qmd"
 
 BIN_UPPER=$(echo "$BIN" | tr '[:lower:]' '[:upper:]')

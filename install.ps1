@@ -7,7 +7,8 @@
 
 $ErrorActionPreference = "Stop"
 $InformationPreference = "Continue"
-$Repo = "qntx-labs/qmd"
+# Fork of the qntx-labs/qmd installer; releases are published from remedialchaos/qmd-rs.
+$Repo = "remedialchaos/qmd-rs"
 $Bin = "qmd"
 
 $BinUpper = $Bin.ToUpper()

@@ -7,7 +7,7 @@ resolver = "3"
 version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/qntx/qmd"
+repository = "https://github.com/remedialchaos/qmd-rs"
 
 [workspace.dependencies]
 qmd = { version = "0.5", path = "qmd" }
