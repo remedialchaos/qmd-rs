@@ -6,7 +6,7 @@
     clippy::unwrap_used
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use qmd::{Collection, Qmd};
@@ -96,4 +96,53 @@ fn fusion_order_is_deterministic_without_models() {
     let second_keys: Vec<&str> = second.iter().map(|hit| hit.key.as_str()).collect();
     assert_eq!(first_keys, second_keys);
     assert_eq!(&first_keys[..2], &["a", "b"]);
+}
+
+#[test]
+fn public_fts_search_paginates_without_duplicates_and_empties_out_of_range() {
+    let corpus =
+        std::env::temp_dir().join(format!("qmd-retrieval-pagination-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&corpus);
+    std::fs::create_dir_all(&corpus).unwrap();
+    for (name, body) in [
+        ("one.md", "# One\nPagination coverage one."),
+        ("two.md", "# Two\nPagination coverage two."),
+        ("three.md", "# Three\nPagination coverage three."),
+        ("four.md", "# Four\nPagination coverage four."),
+    ] {
+        std::fs::write(corpus.join(name), body).unwrap();
+    }
+
+    let qmd = Qmd::open_memory().unwrap();
+    qmd.register_collection(&Collection::new("pagination", corpus.to_string_lossy()))
+        .unwrap();
+    let update = qmd.update(None).unwrap();
+    assert!(update.failures.is_empty());
+
+    let page_one: Vec<String> = qmd
+        .search_fts_with_offset("pagination", 2, 0)
+        .unwrap()
+        .iter()
+        .map(|result| result.doc.display_path())
+        .collect();
+    let page_two: Vec<String> = qmd
+        .search_fts_with_offset("pagination", 2, 2)
+        .unwrap()
+        .iter()
+        .map(|result| result.doc.display_path())
+        .collect();
+    let out_of_range = qmd.search_fts_with_offset("pagination", 2, 4).unwrap();
+
+    assert_eq!(page_one.len(), 2);
+    assert_eq!(page_two.len(), 2);
+    assert!(page_one.iter().all(|path| !page_two.contains(path)));
+    let all_hits: HashSet<&str> = page_one
+        .iter()
+        .chain(page_two.iter())
+        .map(String::as_str)
+        .collect();
+    assert_eq!(all_hits.len(), 4);
+    assert!(out_of_range.is_empty());
+
+    std::fs::remove_dir_all(corpus).unwrap();
 }
