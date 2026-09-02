@@ -427,8 +427,27 @@ impl Db {
         Ok(())
     }
 
-    /// Create FTS synchronization triggers if absent.
+    /// Create FTS synchronization triggers if absent, and upgrade a stale
+    /// `documents_au` trigger on existing databases.
+    ///
+    /// Older qmd versions installed a `documents_au` whose delete arm was
+    /// guarded by `new.active = 0`, so re-indexing a document through
+    /// `INSERT ... ON CONFLICT DO UPDATE` left the stale FTS row in place and
+    /// the subsequent `INSERT OR REPLACE` failed with SQLITE_CONSTRAINT
+    /// (primary-key/rowid conflict in the FTS5 shadow table). Existing
+    /// databases carry the old trigger, so the check must compare trigger
+    /// SQL, not just presence of `documents_ai`.
     fn ensure_fts_triggers(&self) -> Result<()> {
+        const AU_SQL: &str = r"CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+                    DELETE FROM documents_fts WHERE rowid = old.id;
+                    INSERT INTO documents_fts(rowid, filepath, title, body)
+                    SELECT new.id,
+                           new.collection || '/' || new.path,
+                           new.title,
+                           (SELECT doc FROM content WHERE hash = new.hash)
+                    WHERE new.active = 1;
+                END;";
+
         let exists: bool = self
             .conn
             .query_row(
@@ -438,9 +457,26 @@ impl Db {
             )
             .unwrap_or(false);
 
-        if !exists {
-            self.conn.execute_batch(
-                r"
+        if exists {
+            // An existing DB may still carry the broken documents_au; repair
+            // it only when its definition differs from the current one.
+            let au_sql: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='documents_au'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if au_sql.as_deref() != Some(AU_SQL) {
+                self.conn
+                    .execute_batch(&format!("DROP TRIGGER IF EXISTS documents_au; {AU_SQL};"))?;
+            }
+            return Ok(());
+        }
+
+        self.conn.execute_batch(&format!(
+            r"
                 CREATE TRIGGER documents_ai AFTER INSERT ON documents
                 WHEN new.active = 1
                 BEGIN
@@ -456,18 +492,9 @@ impl Db {
                     DELETE FROM documents_fts WHERE rowid = old.id;
                 END;
 
-                CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
-                    DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-                    INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-                    SELECT new.id,
-                           new.collection || '/' || new.path,
-                           new.title,
-                           (SELECT doc FROM content WHERE hash = new.hash)
-                    WHERE new.active = 1;
-                END;
+                {AU_SQL};
                 ",
-            )?;
-        }
+        ))?;
         Ok(())
     }
 
@@ -1674,6 +1701,131 @@ mod tests {
         db.deactivate("docs", "hello.md").unwrap();
         assert!(db.get_document("docs", "hello.md").unwrap().is_none());
         assert_eq!(db.doc_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_upsert_document_updates_fts() {
+        let db = mem_db();
+
+        let old_hash = hash_content("apples and oranges");
+        db.insert_content(&old_hash, "apples and oranges").unwrap();
+        db.upsert_document("docs", "fruit.md", "Fruit", &old_hash)
+            .unwrap();
+
+        let hits = db.search_fts("apples", 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc.path, "fruit.md");
+
+        // Re-ingest the same (collection, path) with new content: the UPSERT
+        // takes the DO UPDATE arm, which fires documents_au. The FTS row for
+        // the old body must be replaced, not duplicated or stale.
+        let new_hash = hash_content("zebras and giraffes");
+        db.insert_content(&new_hash, "zebras and giraffes").unwrap();
+        db.upsert_document("docs", "fruit.md", "Savanna", &new_hash)
+            .unwrap();
+
+        let hits_new = db.search_fts("zebras", 10, None).unwrap();
+        assert_eq!(
+            hits_new.len(),
+            1,
+            "updated doc must be findable by new body"
+        );
+        assert_eq!(hits_new[0].doc.title, "Savanna");
+        assert_eq!(hits_new[0].doc.hash, new_hash);
+
+        let hits_old = db.search_fts("apples", 10, None).unwrap();
+        assert!(hits_old.is_empty(), "old body must no longer match");
+
+        // FTS/document consistency: exactly one FTS row per active document.
+        let fts_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM documents_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1);
+    }
+
+    #[test]
+    fn test_fts_trigger_upgrade_on_existing_db() {
+        // Simulate an existing on-disk DB created by an older qmd that
+        // installed the broken documents_au trigger. ensure_fts_triggers()
+        // must upgrade it, not skip it.
+        let dir = std::env::temp_dir().join(format!("qmd_fts_upgrade_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy.sqlite");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE documents (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    collection  TEXT NOT NULL,
+                    path        TEXT NOT NULL,
+                    title       TEXT NOT NULL,
+                    hash        TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    modified_at TEXT NOT NULL,
+                    active      INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(collection, path)
+                );
+                CREATE VIRTUAL TABLE documents_fts USING fts5(filepath, title, body);
+                CREATE TRIGGER documents_ai AFTER INSERT ON documents
+                WHEN new.active = 1
+                BEGIN
+                    INSERT INTO documents_fts(rowid, filepath, title, body)
+                    SELECT new.id, new.collection || '/' || new.path,
+                           new.title, 'legacy body'
+                    WHERE new.active = 1;
+                END;
+                CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+                    DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+                    INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+                    SELECT new.id, new.collection || '/' || new.path,
+                           new.title, 'legacy body'
+                    WHERE new.active = 1;
+                END;
+                INSERT INTO documents (collection, path, title, hash,
+                                       created_at, modified_at, active)
+                VALUES ('docs', 'legacy.md', 'Legacy', 'legacyhash',
+                        't0', 't0', 1);
+                ",
+            )
+            .unwrap();
+        }
+
+        // Opening the existing DB must repair the trigger (migration path).
+        let db = Db::open(&db_path).unwrap();
+
+        let old_hash = hash_content("apples and oranges");
+        db.insert_content(&old_hash, "apples and oranges").unwrap();
+        db.upsert_document("docs", "legacy.md", "Repaired", &old_hash)
+            .unwrap();
+
+        let hits = db.search_fts("apples", 10, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "upsert on upgraded DB must succeed and index"
+        );
+
+        let trigger_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='documents_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // The repaired trigger must unconditionally remove the old FTS row
+        // before inserting the new one.
+        assert!(
+            trigger_sql.contains("DELETE FROM documents_fts WHERE rowid = old.id;")
+                && !trigger_sql.contains("INSERT OR REPLACE"),
+            "documents_au must delete-then-insert, got: {trigger_sql}"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
