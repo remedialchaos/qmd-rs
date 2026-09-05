@@ -1077,25 +1077,23 @@ impl Db {
 
         let vec_bytes = query_embedding.as_bytes();
 
-        let coll_filter = if collection.is_some() {
-            "AND d.collection = ?3"
-        } else {
-            ""
-        };
-
-        let knn_limit = if collection.is_some() {
-            let count: i64 =
-                self.conn
-                    .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))?;
-            if count == 0 {
+        let sql = if collection.is_some() {
+            if self.vector_count()? == 0 {
                 return Ok(Vec::new());
             }
-            count as usize
+            // Rank only active documents in the selected collection. Native KNN
+            // caps k at 4096 and truncates ties before our document ordering.
+            // Scalar L2 matches vec0's default metric without either limitation.
+            r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
+                     LENGTH(c.doc), vec_distance_L2(ve.embedding, ?1) AS distance
+              FROM documents d
+              JOIN content_vectors cv ON cv.hash = d.hash
+              JOIN vec_embeddings ve ON ve.rowid = cv.rowid
+              JOIN content c ON c.hash = d.hash
+              WHERE d.active = 1 AND d.collection = ?3
+              ORDER BY distance, d.collection, d.path, d.hash
+              LIMIT ?2"
         } else {
-            limit
-        };
-
-        let sql = format!(
             r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
                      LENGTH(c.doc), ve.distance
               FROM vec_embeddings ve
@@ -1104,11 +1102,10 @@ impl Db {
               JOIN content c ON c.hash = d.hash
               WHERE ve.embedding MATCH ?1
                 AND k = ?2
-                {coll_filter}
               ORDER BY ve.distance, d.collection, d.path, d.hash"
-        );
+        };
 
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare(sql)?;
 
         let map_row = |row: &rusqlite::Row<'_>| {
             let body_len: i64 = row.get(5)?;
@@ -1130,7 +1127,7 @@ impl Db {
         };
 
         let mut results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![vec_bytes, knn_limit as i64, coll], map_row)?
+            stmt.query_map(params![vec_bytes, limit as i64, coll], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             stmt.query_map(params![vec_bytes, limit as i64], map_row)?
@@ -2147,6 +2144,21 @@ mod tests {
         )
         .unwrap();
 
+        // Every distractor is closer than the selected hit, so a global
+        // top-4096 prefilter is incorrect as well as a k above sqlite-vec's cap.
+        for seq in 1..4096 {
+            db.insert_embedding_with_fingerprint(
+                &other_hash,
+                seq,
+                0,
+                &[0.0, 0.0, 0.0],
+                "default",
+                &fingerprint,
+            )
+            .unwrap();
+        }
+        assert_eq!(db.vector_count().unwrap(), 4097);
+
         let hits = db
             .search_vec_with_fingerprint(&[0.0, 0.0, 0.0], 1, Some("selected"), &fingerprint)
             .unwrap();
@@ -2235,6 +2247,51 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc.collection, "selected");
         assert_eq!(hits[0].doc.path, "first.md");
+    }
+
+    #[test]
+    fn collection_vector_search_orders_ties_before_large_limits() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        // Reverse insertion order makes rowid-based tie selection incorrect.
+        for i in (0..4097).rev() {
+            let path = format!("{i:04}.md");
+            db.insert_content(&path, &path).unwrap();
+            db.upsert_document("selected", &path, &path, &path).unwrap();
+            db.insert_embedding_with_fingerprint(&path, 0, 0, &[1.0, 0.0], "default", &fingerprint)
+                .unwrap();
+        }
+        // Shared content must not leak a document from another collection.
+        db.upsert_document("other", "0000.md", "shared", "0000.md")
+            .unwrap();
+        db.upsert_document("selected", "inactive.md", "inactive", "0000.md")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE documents SET active = 0 WHERE path = 'inactive.md'",
+                [],
+            )
+            .unwrap();
+
+        for limit in [0, 1, 4096, 4097, 5000] {
+            let hits = db
+                .search_vec_with_fingerprint(&[0.0, 0.0], limit, Some("selected"), &fingerprint)
+                .unwrap();
+            let expected: Vec<_> = (0..limit.min(4097)).map(|i| format!("{i:04}.md")).collect();
+            assert_eq!(
+                hits.iter().map(|hit| &hit.doc.path).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+            assert!(hits.iter().all(|hit| hit.doc.collection == "selected"));
+            assert!(hits.iter().all(|hit| hit.score.abs() < f64::EPSILON));
+        }
+        assert!(
+            db.search_vec_with_fingerprint(&[0.0, 0.0], 10, Some("missing"), &fingerprint)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.vector_count().unwrap(), 4097);
+        assert_eq!(db.doc_count().unwrap(), 4098);
     }
 
     #[test]
