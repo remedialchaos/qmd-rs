@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use qmd::{Collection, DoctorCheckStatus, Qmd};
+use qmd_rs::{Collection, DoctorCheckStatus, Qmd};
 
 /// QMD — local search engine for markdown files.
 #[derive(Parser)]
@@ -200,7 +200,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(index: &Path, command: Command) -> qmd::Result<()> {
+fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
     match command {
         Command::Collection { action } => cmd_collection(index, action),
         Command::Update { collection } => cmd_update(index, &collection),
@@ -254,10 +254,10 @@ fn resolve_index_path(explicit: Option<&Path>) -> PathBuf {
     )
 }
 
-fn prepare_default_index(new_index: &Path, legacy_index: &Path) -> qmd::Result<Option<String>> {
+fn prepare_default_index(new_index: &Path, legacy_index: &Path) -> qmd_rs::Result<Option<String>> {
     if let Some(parent) = new_index.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| qmd::Error::Config(format!("{}: {e}", parent.display())))?;
+            .map_err(|e| qmd_rs::Error::Config(format!("{}: {e}", parent.display())))?;
     }
     if legacy_index.is_file() && !new_index.exists() {
         Ok(Some(format!(
@@ -270,7 +270,7 @@ fn prepare_default_index(new_index: &Path, legacy_index: &Path) -> qmd::Result<O
     }
 }
 
-fn cmd_collection(index: &Path, action: CollectionAction) -> qmd::Result<()> {
+fn cmd_collection(index: &Path, action: CollectionAction) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     match action {
         CollectionAction::Add {
@@ -279,7 +279,7 @@ fn cmd_collection(index: &Path, action: CollectionAction) -> qmd::Result<()> {
             pattern,
         } => {
             let abs = std::fs::canonicalize(&path)
-                .map_err(|e| qmd::Error::Config(format!("{}: {e}", path.display())))?;
+                .map_err(|e| qmd_rs::Error::Config(format!("{}: {e}", path.display())))?;
             let coll = Collection::new(&name, abs.to_string_lossy().as_ref()).with_pattern(pattern);
             qmd.register_collection(&coll)?;
             println!("registered collection '{name}' at {}", abs.display());
@@ -311,7 +311,7 @@ fn cmd_collection(index: &Path, action: CollectionAction) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
+fn cmd_update(index: &Path, collections: &[String]) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     let filter: Option<Vec<&str>> = if collections.is_empty() {
         None
@@ -327,7 +327,7 @@ fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
         eprintln!("failed: {}: {}", failure.path, failure.reason);
     }
     if !r.failures.is_empty() {
-        return Err(qmd::Error::Config(format!(
+        return Err(qmd_rs::Error::Config(format!(
             "{} files failed during update",
             r.failures.len()
         )));
@@ -335,7 +335,7 @@ fn cmd_update(index: &Path, collections: &[String]) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_embed(index: &Path, force: bool, batch: Option<usize>) -> qmd::Result<()> {
+fn cmd_embed(index: &Path, force: bool, batch: Option<usize>) -> qmd_rs::Result<()> {
     let mut qmd = Qmd::open(index)?;
     if force {
         qmd.clear_embeddings()?;
@@ -359,7 +359,7 @@ fn cmd_search(
     offset: usize,
     collection: Option<&str>,
     json: bool,
-) -> qmd::Result<()> {
+) -> qmd_rs::Result<()> {
     let mut qmd = Qmd::open(index)?;
     let results = qmd.search_with_offset_in_collection(query, limit, offset, collection)?;
     if json {
@@ -387,7 +387,7 @@ fn cmd_fts(
     offset: usize,
     collection: Option<&str>,
     json: bool,
-) -> qmd::Result<()> {
+) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     let results = qmd.search_fts_with_offset_in_collection(query, limit, offset, collection)?;
     if json {
@@ -408,7 +408,7 @@ fn cmd_fts(
     Ok(())
 }
 
-fn cmd_get(index: &Path, path: &str, json: bool) -> qmd::Result<()> {
+fn cmd_get(index: &Path, path: &str, json: bool) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     let doc = qmd.get(path)?;
     if json {
@@ -422,7 +422,7 @@ fn cmd_get(index: &Path, path: &str, json: bool) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_status(index: &Path, json: bool) -> qmd::Result<()> {
+fn cmd_status(index: &Path, json: bool) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     let s = qmd.status()?;
     if json {
@@ -447,7 +447,7 @@ fn cmd_status(index: &Path, json: bool) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(index: &Path, json: bool) -> qmd::Result<()> {
+fn cmd_doctor(index: &Path, json: bool) -> qmd_rs::Result<()> {
     let report = Qmd::doctor(index)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -463,12 +463,12 @@ fn cmd_doctor(index: &Path, json: bool) -> qmd::Result<()> {
         }
     }
     if report.has_errors() {
-        return Err(qmd::Error::Config("doctor found index errors".into()));
+        return Err(qmd_rs::Error::Config("doctor found index errors".into()));
     }
     Ok(())
 }
 
-fn cmd_context(index: &Path, action: ContextAction) -> qmd::Result<()> {
+fn cmd_context(index: &Path, action: ContextAction) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     match action {
         ContextAction::Add {
@@ -528,14 +528,14 @@ fn cmd_context(index: &Path, action: ContextAction) -> qmd::Result<()> {
     Ok(())
 }
 
-fn cmd_cleanup(index: &Path) -> qmd::Result<()> {
+fn cmd_cleanup(index: &Path) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     let n = qmd.cleanup()?;
     println!("{n} items cleaned up");
     Ok(())
 }
 
-fn cmd_vacuum(index: &Path) -> qmd::Result<()> {
+fn cmd_vacuum(index: &Path) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
     qmd.vacuum()?;
     println!("database vacuumed");

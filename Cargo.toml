@@ -1,6 +1,6 @@
 [workspace]
-members = ["qmd", "qmd-cli"]
-default-members = ["qmd", "qmd-cli"]
+members = ["qmd-rs", "qmd-rs-cli"]
+default-members = ["qmd-rs", "qmd-rs-cli"]
 resolver = "3"
 
 [workspace.package]
@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/remedialchaos/qmd-rs"
 
 [workspace.dependencies]
-qmd = { version = "0.5", path = "qmd" }
+qmd-rs = { version = "0.5", path = "qmd-rs" }
 
 clap = { version = "4.6.0", features = ["derive"] }
 # Keep TLS in the Rust dependency graph rather than linking to system OpenSSL.

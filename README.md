@@ -19,15 +19,15 @@
 
 | Crate | | Description |
 | --- | --- | --- |
-| **[`qmd`](qmd/)** | [![crates.io][qmd-crate]][qmd-crate-url] [![docs.rs][qmd-doc]][qmd-doc-url] | Core library — indexing, BM25, vector search, hybrid search, embeddings |
-| **[`qmd-cli`](qmd-cli/)** | [![crates.io][cli-crate]][cli-crate-url] | CLI tool — collection management, indexing, and search |
+| **[`qmd-rs`](qmd-rs/)** | [![crates.io][qmd-rs-crate]][qmd-rs-crate-url] [![docs.rs][qmd-rs-doc]][qmd-rs-doc-url] | Core library — indexing, BM25, vector search, hybrid search, embeddings |
+| **[`qmd-rs-cli`](qmd-rs-cli/)** | [![crates.io][qmd-rs-cli-crate]][qmd-rs-cli-crate-url] | CLI tool — collection management, indexing, and search |
 
-[qmd-crate]: https://img.shields.io/crates/v/qmd.svg
-[qmd-crate-url]: https://crates.io/crates/qmd
-[cli-crate]: https://img.shields.io/crates/v/qmd-cli.svg
-[cli-crate-url]: https://crates.io/crates/qmd-cli
-[qmd-doc]: https://img.shields.io/docsrs/qmd.svg
-[qmd-doc-url]: https://docs.rs/qmd
+[qmd-rs-crate]: https://img.shields.io/crates/v/qmd-rs.svg
+[qmd-rs-crate-url]: https://crates.io/crates/qmd-rs
+[qmd-rs-cli-crate]: https://img.shields.io/crates/v/qmd-rs-cli.svg
+[qmd-rs-cli-crate-url]: https://crates.io/crates/qmd-rs-cli
+[qmd-rs-doc]: https://img.shields.io/docsrs/qmd-rs.svg
+[qmd-rs-doc-url]: https://docs.rs/qmd-rs
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ irm https://raw.githubusercontent.com/remedialchaos/qmd-rs/main/install.ps1 | ie
 Or via Cargo:
 
 ```bash
-cargo install qmd-cli
+cargo install qmd-rs-cli
 ```
 
 ### CLI Usage

@@ -50,7 +50,7 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          cargo build --locked --release --package qmd-cli --target "${{ matrix.target }}"
+          cargo build --locked --release --package qmd-rs-cli --target "${{ matrix.target }}"
       - name: Package Unix artifact
         if: matrix.archive == 'tar.gz'
         shell: bash

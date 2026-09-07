@@ -6,7 +6,7 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use qmd::{Qmd, Collection};
+//! use qmd_rs::{Qmd, Collection};
 //!
 //! let mut qmd = Qmd::open("./index.sqlite")?;
 //! qmd.register_collection(&Collection::new("docs", "/path/to/docs"))?;
@@ -18,7 +18,7 @@
 //!
 //! // Or just BM25
 //! let fts_results = qmd.search_fts("rust ownership", 10)?;
-//! # Ok::<(), qmd::Error>(())
+//! # Ok::<(), qmd_rs::Error>(())
 //! ```
 
 pub mod chunk;

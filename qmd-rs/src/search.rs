@@ -142,7 +142,7 @@ fn sanitize_fts5_term(term: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use qmd::search::build_fts5_query;
+/// use qmd_rs::search::build_fts5_query;
 ///
 /// assert_eq!(
 ///     build_fts5_query("performance -sports"),

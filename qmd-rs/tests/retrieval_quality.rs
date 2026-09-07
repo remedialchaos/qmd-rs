@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use qmd::{Collection, Qmd};
+use qmd_rs::{Collection, Qmd};
 use serde::Deserialize;
 
 const JUDGMENTS: &str = include_str!("fixtures/retrieval-quality/judgments.json");
@@ -90,8 +90,8 @@ fn fts_retrieval_quality_meets_checked_in_thresholds() {
 fn fusion_order_is_deterministic_without_models() {
     let lexical = vec!["a".to_string(), "b".to_string(), "c".to_string()];
     let semantic = vec!["b".to_string(), "a".to_string(), "d".to_string()];
-    let first = qmd::search::rrf(&[&lexical, &semantic], None, 60);
-    let second = qmd::search::rrf(&[&lexical, &semantic], None, 60);
+    let first = qmd_rs::search::rrf(&[&lexical, &semantic], None, 60);
+    let second = qmd_rs::search::rrf(&[&lexical, &semantic], None, 60);
     let first_keys: Vec<&str> = first.iter().map(|hit| hit.key.as_str()).collect();
     let second_keys: Vec<&str> = second.iter().map(|hit| hit.key.as_str()).collect();
     assert_eq!(first_keys, second_keys);

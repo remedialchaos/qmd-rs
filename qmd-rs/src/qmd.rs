@@ -1,14 +1,14 @@
 //! Top-level facade: [`Qmd`] owns the database and ML engines.
 //!
 //! ```rust,no_run
-//! use qmd::{Qmd, Collection};
+//! use qmd_rs::{Qmd, Collection};
 //!
 //! let mut qmd = Qmd::open("./index.sqlite")?;
 //! qmd.register_collection(&Collection::new("docs", "/path/to/docs"))?;
 //! qmd.update(None)?;
 //! qmd.embed()?;
 //! let results = qmd.search("how does auth work?", 10)?;
-//! # Ok::<(), qmd::Error>(())
+//! # Ok::<(), qmd_rs::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};

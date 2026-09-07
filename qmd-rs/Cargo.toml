@@ -1,5 +1,5 @@
 [package]
-name = "qmd"
+name = "qmd-rs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ keywords = ["markdown", "search", "embedding", "fts5", "ai"]
 categories = ["text-processing", "database"]
 
 [lib]
-name = "qmd"
+name = "qmd_rs"
 path = "src/lib.rs"
 
 [dependencies]
