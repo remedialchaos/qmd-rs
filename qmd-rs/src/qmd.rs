@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
 
 use crate::chunk::Chunker;
 use crate::db::{
@@ -643,13 +644,6 @@ fn walk_collection(
         .add(pattern)
         .map_err(|e| Error::Config(e.to_string()))?;
 
-    for pat in ignore_patterns {
-        let negated = format!("!{pat}");
-        builder
-            .add(&negated)
-            .map_err(|e| Error::Config(e.to_string()))?;
-    }
-
     for dir in EXCLUDE_DIRS {
         let neg = format!("!{dir}/");
         builder
@@ -658,17 +652,41 @@ fn walk_collection(
     }
 
     let overrides = builder.build().map_err(|e| Error::Config(e.to_string()))?;
+    let mut ignore_builder = GitignoreBuilder::new(base);
+    for ignore_pattern in ignore_patterns {
+        ignore_builder
+            .add_line(None, ignore_pattern)
+            .map_err(|e| Error::Config(e.to_string()))?;
+    }
+    let custom_ignores = ignore_builder
+        .build()
+        .map_err(|e| Error::Config(e.to_string()))?;
 
     let mut files = Vec::new();
-    let walker = WalkBuilder::new(base)
-        .overrides(overrides)
-        .hidden(true)
-        .git_ignore(true)
-        .build();
+    let walker = WalkBuilder::new(base).hidden(true).git_ignore(true).build();
 
     for dir_entry in walker {
         let entry = dir_entry.map_err(|e| Error::Config(e.to_string()))?;
-        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(base)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        if relative.components().any(|component| {
+            EXCLUDE_DIRS.contains(&component.as_os_str().to_string_lossy().as_ref())
+        }) {
+            continue;
+        }
+        if custom_ignores
+            .matched_path_or_any_parents(path, false)
+            .is_ignore()
+        {
+            continue;
+        }
+        if overrides.matched(relative, false).is_whitelist() {
             files.push(entry.into_path());
         }
     }
@@ -699,8 +717,93 @@ fn collect_results(
 mod tests {
     use super::{Qmd, sort_results_stably};
     use crate::chunk::Chunker;
+    use crate::db::Collection;
     use crate::db::{Document, SearchResult, SearchSource};
     use crate::embed::embedding_fingerprint;
+
+    #[test]
+    fn default_collection_walk_excludes_hidden_and_gitignored_markdown() {
+        use std::fs;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "qmd-default-exclusions-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("visible/nested")).unwrap();
+        fs::create_dir_all(root.join(".hidden-dir")).unwrap();
+        fs::create_dir_all(root.join("ignored-dir")).unwrap();
+        fs::create_dir_all(root.join("custom-dir/nested")).unwrap();
+        fs::write(root.join("visible.md"), "visible searchable markdown").unwrap();
+        fs::write(
+            root.join("visible/nested/nested.md"),
+            "nested searchable markdown",
+        )
+        .unwrap();
+        fs::write(root.join(".hidden.md"), "hidden searchable markdown").unwrap();
+        fs::write(
+            root.join(".hidden-dir/hidden.md"),
+            "hidden dir searchable markdown",
+        )
+        .unwrap();
+        fs::write(root.join("ignored.md"), "ignored searchable markdown").unwrap();
+        fs::write(
+            root.join("ignored-dir/ignored.md"),
+            "ignored dir searchable markdown",
+        )
+        .unwrap();
+        fs::write(
+            root.join("custom-dir/nested/custom.md"),
+            "custom ignored searchable markdown",
+        )
+        .unwrap();
+        fs::write(root.join("notes.txt"), "text searchable but not markdown").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.md\nignored-dir/\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let qmd = Qmd::open_memory().unwrap();
+        qmd.register_collection(&Collection::new("docs", root.to_string_lossy()))
+            .unwrap();
+        qmd.update(None).unwrap();
+
+        let hits = qmd.search_fts("searchable", 20).unwrap();
+        let paths: Vec<_> = hits.iter().map(|hit| hit.doc.path.as_str()).collect();
+        assert!(paths.iter().any(|path| path.ends_with("visible.md")));
+        assert!(paths.iter().any(|path| path.ends_with("nested.md")));
+        assert!(paths.iter().any(|path| path.ends_with("custom.md")));
+        assert!(!paths.iter().any(|path| path.ends_with(".hidden.md")));
+        assert!(!paths.iter().any(|path| path.ends_with("hidden.md")));
+        assert!(!paths.iter().any(|path| path.ends_with("ignored.md")));
+        assert!(!paths.iter().any(|path| path.ends_with("notes.txt")));
+
+        qmd.register_collection(
+            &Collection::new("docs", root.to_string_lossy())
+                .with_ignore(vec!["custom-dir/".to_string()]),
+        )
+        .unwrap();
+        qmd.update(None).unwrap();
+        let filtered_hits = qmd.search_fts("searchable", 20).unwrap();
+        let filtered_paths: Vec<_> = filtered_hits
+            .iter()
+            .map(|hit| hit.doc.path.as_str())
+            .collect();
+        assert!(
+            !filtered_paths
+                .iter()
+                .any(|path| path.ends_with("custom.md"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn custom_chunker_changes_active_embedding_fingerprint() {
