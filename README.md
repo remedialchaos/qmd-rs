@@ -119,7 +119,7 @@ gate exercises real FTS indexing, computes MRR, Recall@3, and nDCG@3, and checks
 deterministic fusion without downloading a model:
 
 ```bash
-cargo test -p qmd --test retrieval_quality
+cargo test -p qmd-rs --test retrieval_quality
 ```
 
 ## License
