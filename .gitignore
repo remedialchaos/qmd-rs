@@ -21,3 +21,15 @@ target
 #.idea/
 
 # /3rdparty
+
+# fastembed model cache (regenerated on next embed run)
+.fastembed_cache/
+
+# hermes scratch + plan files (per-machine, not source)
+.hermes/
+
+# linked worktree roots (managed by `git worktree`, never committed)
+.worktrees/
+
+# disposable spike/prototype artifacts (measurement only, never merged)
+spikes/
