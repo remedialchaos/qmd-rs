@@ -278,22 +278,93 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
 /// Extract a relevant snippet from `body` around query terms.
 #[must_use]
 pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
-    if body.len() <= max_chars {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let chars: Vec<char> = body.chars().collect();
+    if chars.len() <= max_chars {
         return body.to_string();
     }
 
     let body_lower = body.to_lowercase();
-    let start_pos = query
+    let match_info = query
         .split_whitespace()
-        .filter(|t| t.len() >= 3)
-        .find_map(|t| body_lower.find(&t.to_lowercase()))
-        .map_or(0, |p| p.saturating_sub(50));
+        .filter(|t| t.chars().count() >= 3)
+        .find_map(|term| {
+            body_lower
+                .find(&term.to_lowercase())
+                .map(|position| (position, term.chars().count()))
+        });
+    let match_char = match_info.map_or(0, |(lower_pos, _)| {
+        let mut lower_offset = 0;
+        for (char_index, ch) in body.char_indices() {
+            if lower_pos <= lower_offset {
+                return body[..char_index].chars().count();
+            }
+            let lower_len = ch.to_lowercase().collect::<String>().len();
+            if lower_pos < lower_offset + lower_len {
+                return body[..char_index].chars().count();
+            }
+            lower_offset += lower_len;
+        }
+        chars.len()
+    });
+    let start = match match_info {
+        Some((_, term_len)) if term_len <= max_chars => {
+            let centered = match_char.saturating_sub(max_chars / 2);
+            let required = match_char
+                .saturating_add(term_len)
+                .saturating_sub(max_chars);
+            centered.max(required).min(chars.len() - max_chars)
+        }
+        Some(_) => match_char.min(chars.len() - max_chars),
+        None => match_char.saturating_sub(50),
+    };
+    let end = start + max_chars;
 
-    let line_start = body[..start_pos].rfind('\n').map_or(0, |p| p + 1);
-    let end_pos = (line_start + max_chars).min(body.len());
-    let line_end = body[end_pos..]
-        .find('\n')
-        .map_or(body.len(), |p| end_pos + p);
+    chars[start..end].iter().collect()
+}
 
-    body[line_start..line_end].to_string()
+#[cfg(test)]
+mod tests {
+    use super::extract_snippet;
+
+    #[test]
+    fn unicode_case_matching_never_slices_inside_utf8() {
+        let body = "prefix 😀 café 東京 İSTANBUL target suffix";
+
+        let snippet = extract_snippet(body, "istanbul", 12);
+
+        assert!(snippet.is_char_boundary(snippet.len()));
+        assert!(snippet.chars().count() <= 12);
+    }
+
+    #[test]
+    fn snippet_never_exceeds_budget_when_line_is_longer() {
+        let body = "before\nthis line contains the target and keeps going\nafter";
+
+        let snippet = extract_snippet(body, "target", 10);
+
+        assert_eq!(snippet.chars().count(), 10);
+        assert!(snippet.contains("target"));
+    }
+
+    #[test]
+    fn zero_budget_and_query_miss_are_empty_or_bounded() {
+        let body = "accentué 中文 😀\nlong line without a match";
+
+        assert_eq!(extract_snippet(body, "match", 0), "");
+        assert!(extract_snippet(body, "absent", 5).chars().count() <= 5);
+    }
+
+    #[test]
+    fn match_near_start_with_larger_budget_does_not_panic() {
+        let body = "target and a long tail that exceeds the budget";
+
+        let snippet = extract_snippet(body, "target", 10);
+
+        assert_eq!(snippet.chars().count(), 10);
+        assert!(snippet.contains("target"));
+    }
 }
