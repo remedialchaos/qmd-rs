@@ -24,7 +24,7 @@ use crate::db::{
 };
 use crate::embed::{Embedder, default_embedding_fingerprint_with_chunker};
 use crate::error::{Error, Result};
-use crate::rerank::Reranker;
+use crate::rerank::{Reranker, Scored};
 use crate::search::{self, Query, QueryType};
 
 /// The main qmd handle.
@@ -520,15 +520,14 @@ impl Qmd {
         }
 
         let top_n = results.len().min(limit * 2);
-        let snippets: Vec<String> = results[..top_n]
-            .iter()
-            .filter_map(|r| {
-                self.db
-                    .get_body(&r.doc.hash)
-                    .ok()?
-                    .map(|body| search::extract_snippet(&body, query, 4000))
-            })
-            .collect();
+        let mut snippets: Vec<String> = Vec::new();
+        let mut snippet_sources: Vec<usize> = Vec::new();
+        for (index, r) in results[..top_n].iter().enumerate() {
+            if let Ok(Some(body)) = self.db.get_body(&r.doc.hash) {
+                snippets.push(search::extract_snippet(&body, query, 4000));
+                snippet_sources.push(index);
+            }
+        }
 
         if snippets.is_empty() {
             return;
@@ -540,23 +539,8 @@ impl Qmd {
             return;
         };
 
-        let mut reranked: Vec<SearchResult> = Vec::with_capacity(scored.len());
-        let mut used: HashSet<usize> = HashSet::new();
-        for s in &scored {
-            if s.index < results.len() {
-                let mut r = results[s.index].clone();
-                r.score = f64::from(s.score);
-                reranked.push(r);
-                used.insert(s.index);
-            }
-        }
-        for (i, r) in results.iter().enumerate() {
-            if !used.contains(&i) {
-                reranked.push(r.clone());
-            }
-        }
-        sort_results_stably(&mut reranked);
-        *results = reranked;
+        let ordered = reranked_results(results, &snippet_sources, &scored);
+        *results = ordered;
     }
 
     // ── Document retrieval ──────────────────────────────────────────────
@@ -623,14 +607,50 @@ impl Qmd {
     }
 }
 
-/// Apply the total order used after fusion and reranking.
-fn sort_results_stably(results: &mut [SearchResult]) {
-    results.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.doc.display_path().cmp(&b.doc.display_path()))
-            .then_with(|| a.doc.hash.cmp(&b.doc.hash))
-    });
+/// Order fusion results after cross-encoder reranking.
+///
+/// `snippet_sources[i]` records the position in `results` of the document whose
+/// snippet was the `i`-th string handed to the reranker, so reranker indices can
+/// be mapped back through stable document identity instead of snippet position.
+fn reranked_results(
+    results: &[SearchResult],
+    snippet_sources: &[usize],
+    scored: &[Scored],
+) -> Vec<SearchResult> {
+    let mut candidates: Vec<(usize, f32, usize)> = Vec::with_capacity(scored.len());
+    let mut used: HashSet<usize> = HashSet::with_capacity(scored.len());
+    for s in scored {
+        // Map the reranker's snippet position back to the original document.
+        let Some(&result_index) = snippet_sources.get(s.index) else {
+            continue;
+        };
+        if result_index >= results.len() {
+            continue;
+        }
+        if !used.insert(result_index) {
+            continue;
+        }
+        candidates.push((result_index, s.score, s.index));
+    }
+
+    // Order only within the cross-encoder scale: score descending, then the
+    // candidate's original fusion position. Untouched RRF scores are never
+    // compared against cross-encoder scores.
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+
+    let mut ordered: Vec<SearchResult> = Vec::with_capacity(results.len());
+    for (result_index, score, _) in &candidates {
+        let mut r = results[*result_index].clone();
+        r.score = f64::from(*score);
+        ordered.push(r);
+    }
+    // The unreranked tail keeps its prior fusion order.
+    for (i, r) in results.iter().enumerate() {
+        if !used.contains(&i) {
+            ordered.push(r.clone());
+        }
+    }
+    ordered
 }
 
 /// Walk a collection directory using the `ignore` crate (gitignore-aware).
@@ -715,11 +735,138 @@ fn collect_results(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{Qmd, sort_results_stably};
+    use super::{Qmd, reranked_results};
     use crate::chunk::Chunker;
     use crate::db::Collection;
     use crate::db::{Document, SearchResult, SearchSource};
     use crate::embed::embedding_fingerprint;
+    use crate::rerank::Scored;
+
+    /// Build a fusion result for a `docs/<path>` document with `score`.
+    fn search_result(path: &str, score: f64) -> SearchResult {
+        SearchResult {
+            doc: Document {
+                collection: "docs".into(),
+                path: path.into(),
+                title: path.into(),
+                hash: format!("hash-{path}"),
+                modified_at: String::new(),
+                body_len: 0,
+                body: None,
+            },
+            score,
+            source: SearchSource::Fts,
+        }
+    }
+
+    fn paths(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.doc.path.as_str()).collect()
+    }
+
+    #[test]
+    fn rerank_index_maps_through_original_identity_not_snippet_position() {
+        // Fusion order is [a, b, c]; b has no readable body, so only a and c
+        // were handed to the reranker (snippet positions 0 and 1).
+        let results = vec![
+            search_result("a.md", 1.0),
+            search_result("b.md", 1.0),
+            search_result("c.md", 1.0),
+        ];
+        let snippet_sources = [0usize, 2usize];
+        // The reranker ranks its second snippet best, which is c.md.
+        let scored = [Scored {
+            index: 1,
+            score: 0.9,
+        }];
+
+        let ordered = reranked_results(&results, &snippet_sources, &scored);
+
+        // Exactly one document carries the cross-encoder score; it must be c.md.
+        let winner = f64::from(0.9_f32);
+        let reranked = ordered
+            .iter()
+            .find(|r| r.score.total_cmp(&winner).is_eq())
+            .expect("reranked candidate should be present");
+        assert_eq!(reranked.doc.path, "c.md");
+        assert_ne!(reranked.doc.path, "b.md");
+    }
+
+    #[test]
+    fn rerank_keeps_reranked_prefix_and_untouched_fusion_tail() {
+        // RRF scores on the untouched tail intentionally dwarf the cross-encoder
+        // scores, so any global score sort would reorder the tail ahead.
+        let results = vec![
+            search_result("a.md", 3.0),
+            search_result("b.md", 2.0),
+            search_result("c.md", 1.0),
+            search_result("d.md", 0.5),
+        ];
+        let snippet_sources = [0usize, 1, 2, 3];
+        // Reranker returns c then a; b and d fall outside the reranker limit.
+        let scored = [
+            Scored {
+                index: 2,
+                score: 0.9,
+            },
+            Scored {
+                index: 0,
+                score: 0.4,
+            },
+        ];
+
+        let ordered = reranked_results(&results, &snippet_sources, &scored);
+
+        assert_eq!(paths(&ordered), ["c.md", "a.md", "b.md", "d.md"]);
+        // The tail keeps its fusion score and does not jump the prefix.
+        assert_eq!(ordered[2].doc.path, "b.md");
+        let b_fusion = results[1].score;
+        assert!(ordered[2].score.total_cmp(&b_fusion).is_eq());
+        assert!(ordered[2].score > ordered[1].score);
+    }
+
+    #[test]
+    fn rerank_ties_keep_prior_fusion_order() {
+        // Fusion order deliberately differs from lexical path order.
+        let results = vec![
+            search_result("b.md", 1.0),
+            search_result("a.md", 1.0),
+            search_result("c.md", 1.0),
+        ];
+        let snippet_sources = [0usize, 1, 2];
+        // Equal cross-encoder scores, deliberately returned out of order.
+        let scored = [
+            Scored {
+                index: 2,
+                score: 0.5,
+            },
+            Scored {
+                index: 0,
+                score: 0.5,
+            },
+            Scored {
+                index: 1,
+                score: 0.5,
+            },
+        ];
+
+        let ordered = reranked_results(&results, &snippet_sources, &scored);
+
+        assert_eq!(paths(&ordered), ["b.md", "a.md", "c.md"]);
+    }
+
+    #[test]
+    fn rerank_without_scores_keeps_prior_fusion_order() {
+        let results = vec![
+            search_result("a.md", 1.0),
+            search_result("b.md", 3.0),
+            search_result("c.md", 2.0),
+        ];
+        let snippet_sources = [0usize, 1, 2];
+
+        let ordered = reranked_results(&results, &snippet_sources, &[]);
+
+        assert_eq!(paths(&ordered), ["a.md", "b.md", "c.md"]);
+    }
 
     #[test]
     fn default_collection_walk_excludes_hidden_and_gitignored_markdown() {
@@ -841,31 +988,6 @@ mod tests {
         assert!(!result.failures[0].reason.is_empty());
         assert_eq!(qmd.doc_count().unwrap(), 1);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn reranked_score_ties_use_stable_document_identity() {
-        let make_result = |collection: &str, path: &str| SearchResult {
-            doc: Document {
-                collection: collection.into(),
-                path: path.into(),
-                title: path.into(),
-                hash: format!("{collection}-{path}"),
-                modified_at: String::new(),
-                body_len: 0,
-                body: None,
-            },
-            score: 1.0,
-            source: SearchSource::Fts,
-        };
-        let mut results = vec![
-            make_result("b", "same.md"),
-            make_result("a", "z.md"),
-            make_result("a", "a.md"),
-        ];
-        sort_results_stably(&mut results);
-        let paths: Vec<String> = results.iter().map(|hit| hit.doc.display_path()).collect();
-        assert_eq!(paths, ["a/a.md", "a/z.md", "b/same.md"]);
     }
 
     #[test]
