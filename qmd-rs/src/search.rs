@@ -257,7 +257,13 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
             .and_then(|ws| ws.get(list_idx))
             .copied()
             .unwrap_or(1.0);
+        let mut counted: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (rank, key) in keys.iter().enumerate() {
+            // A repeated key inside one backend list contributes only at its
+            // first rank; later occurrences must not inflate its score.
+            if !counted.insert(key.as_str()) {
+                continue;
+            }
             #[allow(clippy::cast_precision_loss)]
             let s = w / (k + rank + 1) as f64;
             *scores.entry(key.as_str()).or_default() += s;
@@ -328,7 +334,40 @@ pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_snippet;
+    use super::{extract_snippet, rrf};
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn rrf_counts_each_key_once_per_list_retaining_first_rank() {
+        let list = vec!["B".to_string(), "A".to_string(), "A".to_string()];
+
+        let hits = rrf(&[&list], None, 60);
+
+        let score_of = |key: &str| {
+            hits.iter()
+                .find(|hit| hit.key == key)
+                .unwrap_or_else(|| panic!("missing key {key}"))
+                .score
+        };
+
+        assert!((score_of("B") - 1.0 / 61.0).abs() < 1e-12);
+        assert!(
+            (score_of("A") - 1.0 / 62.0).abs() < 1e-12,
+            "duplicate keys must count once at their first rank"
+        );
+    }
+
+    #[test]
+    fn rrf_breaks_equal_scores_deterministically_by_key() {
+        let lexical = vec!["A".to_string(), "B".to_string()];
+        let semantic = vec!["B".to_string(), "A".to_string()];
+
+        let hits = rrf(&[&lexical, &semantic], None, 60);
+
+        let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
+        assert_eq!(keys, ["A", "B"]);
+        assert!((hits[0].score - hits[1].score).abs() < 1e-12);
+    }
 
     #[test]
     fn unicode_case_matching_never_slices_inside_utf8() {
