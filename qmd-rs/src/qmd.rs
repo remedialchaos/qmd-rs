@@ -195,6 +195,18 @@ impl Qmd {
         let mut unchanged = 0usize;
         let mut failures = Vec::new();
 
+        // Paths still present on disk after this scan. A path whose source is
+        // empty/whitespace-only is removed from this set so the trailing
+        // deactivation pass can retire its previously active document.
+        let mut new_paths: HashSet<String> = files
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(base)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+            })
+            .collect();
+
         for file_path in &files {
             let rel = file_path
                 .strip_prefix(base)
@@ -213,6 +225,7 @@ impl Qmd {
                 }
             };
             if content.trim().is_empty() {
+                new_paths.remove(&rel);
                 continue;
             }
 
@@ -232,15 +245,6 @@ impl Qmd {
             self.db.insert_content(&hash, &content)?;
             self.db.upsert_document(&coll.name, &rel, &title, &hash)?;
         }
-
-        let new_paths: HashSet<String> = files
-            .iter()
-            .filter_map(|p| {
-                p.strip_prefix(base)
-                    .ok()
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-            })
-            .collect();
 
         let mut removed = 0usize;
         for path in &existing_set {
@@ -1008,6 +1012,52 @@ mod tests {
         assert!(!report.has_errors());
         assert_eq!(before, after);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn emptied_source_deactivates_and_later_nonempty_update_reactivates() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "qmd-empty-source-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("note.md");
+        fs::write(&file, "# note\nsearchable orange content").unwrap();
+
+        let qmd = Qmd::open_memory().unwrap();
+        qmd.register_collection(&Collection::new("docs", root.to_string_lossy()))
+            .unwrap();
+        let first = qmd.update(None).unwrap();
+        assert_eq!(first.indexed, 1);
+        assert_eq!(qmd.doc_count().unwrap(), 1);
+        assert_eq!(qmd.search_fts("orange", 10).unwrap().len(), 1);
+
+        // Emptied source: the previously active document must be deactivated
+        // rather than left behind as a stale, still-searchable path.
+        fs::write(&file, "").unwrap();
+        let emptied = qmd.update(None).unwrap();
+        assert_eq!(emptied.removed, 1);
+        assert_eq!(qmd.doc_count().unwrap(), 0);
+        assert!(qmd.search_fts("orange", 10).unwrap().is_empty());
+
+        // Whitespace-only content is equivalent to empty for deactivation.
+        fs::write(&file, "   \n\t\n").unwrap();
+        let whitespace = qmd.update(None).unwrap();
+        assert_eq!(whitespace.removed, 0);
+        assert_eq!(qmd.doc_count().unwrap(), 0);
+
+        // A later nonempty write reactivates the same path normally.
+        fs::write(&file, "# note\nsearchable orange content again").unwrap();
+        let restored = qmd.update(None).unwrap();
+        assert_eq!(restored.indexed, 1);
+        assert_eq!(qmd.doc_count().unwrap(), 1);
+        assert_eq!(qmd.search_fts("orange", 10).unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
