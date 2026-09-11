@@ -22,7 +22,7 @@ use crate::db::{
     Collection, CollectionInfo, Db, DoctorReport, Document, IndexStatus, SearchResult,
     extract_title, hash_content,
 };
-use crate::embed::{Embedder, default_embedding_fingerprint_with_chunker};
+use crate::embed::{Embedder, EmbeddingEngine, default_embedding_fingerprint_with_chunker};
 use crate::error::{Error, Result};
 use crate::rerank::{Reranker, Scored};
 use crate::search::{self, Query, QueryType};
@@ -35,7 +35,7 @@ pub struct Qmd {
     /// SQLite database handle.
     db: Db,
     /// Lazily-loaded embedding engine.
-    embedder: Option<Embedder>,
+    embedder: Option<Box<dyn EmbeddingEngine>>,
     /// Lazily-loaded reranking engine.
     reranker: Option<Reranker>,
     /// Document chunker for embedding.
@@ -50,6 +50,13 @@ impl std::fmt::Debug for Qmd {
             .finish_non_exhaustive()
     }
 }
+
+/// Default number of unique content hashes processed per embedding work group.
+///
+/// A default embedding run streams the unembedded corpus through groups of this
+/// size, so it never retains a whole corpus of documents or all generated
+/// vectors at once.
+pub const DEFAULT_EMBED_GROUP_SIZE: usize = 32;
 
 impl Qmd {
     /// Open (or create) a qmd index at the given SQLite path.
@@ -91,7 +98,7 @@ impl Qmd {
     /// Ensure the embedder is loaded, lazily initializing on first call.
     fn ensure_embedder(&mut self) -> Result<()> {
         if self.embedder.is_none() {
-            self.embedder = Some(Embedder::new()?);
+            self.embedder = Some(Box::new(Embedder::new()?));
         }
         Ok(())
     }
@@ -266,68 +273,97 @@ impl Qmd {
     // ── Embedding ───────────────────────────────────────────────────────
 
     /// Generate embeddings for all documents that need them.
+    ///
+    /// Work streams through bounded groups of [`DEFAULT_EMBED_GROUP_SIZE`]
+    /// unique content hashes; each group is generated outside any write
+    /// transaction and published only for the documents that completed.
     pub fn embed(&mut self) -> Result<EmbedResult> {
         self.embed_with_batch(None)
     }
 
-    /// Generate embeddings for up to `batch` documents.
+    /// Generate embeddings for unembedded documents.
+    ///
+    /// A default run streams the whole unembedded corpus through bounded groups
+    /// of [`DEFAULT_EMBED_GROUP_SIZE`] unique content hashes. `batch` caps the
+    /// total number of documents embedded by this invocation while groups stay
+    /// bounded. Each group is fetched, generated, and published independently,
+    /// so completed work survives an unrelated failure and no whole-corpus or
+    /// whole-vector collection is retained in memory.
     pub fn embed_with_batch(&mut self, batch: Option<usize>) -> Result<EmbedResult> {
         let fingerprint = self.current_embedding_fingerprint();
         self.db.validate_embedding_fingerprint(&fingerprint)?;
-        let docs = self.db.unembedded_docs_with_limit(batch)?;
-        if docs.is_empty() {
-            return Ok(EmbedResult {
-                embedded: 0,
-                chunks: 0,
-                remaining: self.db.needs_embedding_count()?,
-                failures: 0,
-                failure_messages: Vec::new(),
-            });
-        }
 
-        self.ensure_embedder()?;
-
+        let mut budget = batch;
+        let mut cursor: i64 = 0;
+        let mut embedded = 0usize;
         let mut total_chunks = 0usize;
         let mut failures = 0usize;
-        let mut failure_messages = Vec::new();
-        let mut pending = Vec::new();
-        let mut successful_docs = 0usize;
-        for (hash, path, body) in &docs {
-            let chunks = self.chunker.split(body);
-            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-            let embed_result = self
-                .embedder
-                .as_mut()
-                .unwrap_or_else(|| unreachable!())
-                .embed_documents(&texts);
-            let Ok(embeddings) = embed_result else {
-                failures += 1;
-                failure_messages.push(format!("failed: {path}"));
-                continue;
-            };
-            for (seq, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
-                pending.push((hash.as_str(), seq, chunk.pos, emb));
+        let mut failure_messages: Vec<String> = Vec::new();
+        let mut engine_ready = false;
+
+        loop {
+            let request = budget.map_or(DEFAULT_EMBED_GROUP_SIZE, |left| {
+                left.min(DEFAULT_EMBED_GROUP_SIZE)
+            });
+            if request == 0 {
+                break;
             }
-            successful_docs += 1;
-            total_chunks += chunks.len();
+            let group = self.db.unembedded_doc_group(request, cursor)?;
+            let Some(last) = group.last() else {
+                break;
+            };
+            cursor = last.3;
+            if let Some(left) = budget.as_mut() {
+                *left -= group.len();
+            }
+            if !engine_ready {
+                self.ensure_embedder()?;
+                engine_ready = true;
+            }
+
+            // Generate every document's vectors before touching the database.
+            let mut pending: Vec<(&str, usize, usize, Vec<f32>)> = Vec::new();
+            for (hash, alias, body, _) in &group {
+                let chunks = self.chunker.split(body);
+                let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+                let embed_result = self
+                    .embedder
+                    .as_mut()
+                    .unwrap_or_else(|| unreachable!())
+                    .embed_documents(&texts);
+                match embed_result {
+                    Ok(embeddings) if embeddings.len() == chunks.len() => {
+                        for (seq, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
+                            pending.push((hash.as_str(), seq, chunk.pos, emb));
+                        }
+                        embedded += 1;
+                        total_chunks += chunks.len();
+                    }
+                    Ok(_) => {
+                        failures += 1;
+                        failure_messages.push(format!(
+                            "failed: {alias} (hash {hash}): embedded chunk count mismatch"
+                        ));
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        failure_messages.push(format!("failed: {alias} (hash {hash}): {error}"));
+                    }
+                }
+            }
+
+            // Publish only this group's complete, successful documents.
+            if !pending.is_empty() {
+                self.db
+                    .replace_embeddings_transactionally(&fingerprint, &pending)?;
+            }
         }
 
-        if failures > 0 {
-            return Ok(EmbedResult {
-                embedded: 0,
-                chunks: 0,
-                remaining: self.db.needs_embedding_count()?,
-                failures,
-                failure_messages,
-            });
-        }
-        self.db
-            .replace_embeddings_transactionally(&fingerprint, &pending)?;
         Ok(EmbedResult {
-            embedded: successful_docs,
+            embedded,
             chunks: total_chunks,
             remaining: self.db.needs_embedding_count()?,
-            failures: 0,
+            failures,
             failure_messages,
         })
     }
@@ -739,12 +775,68 @@ fn collect_results(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{Qmd, reranked_results};
+    use super::{DEFAULT_EMBED_GROUP_SIZE, Qmd, reranked_results};
     use crate::chunk::Chunker;
     use crate::db::Collection;
+    use crate::db::hash_content;
     use crate::db::{Document, SearchResult, SearchSource};
-    use crate::embed::embedding_fingerprint;
+    use crate::embed::{EmbeddingEngine, embedding_fingerprint};
+    use crate::error::{Error, Result};
     use crate::rerank::Scored;
+    use std::sync::{Arc, Mutex};
+
+    /// Deterministic test double for the embedding engine: records every
+    /// document batch it is asked to embed and can fail any batch whose text
+    /// contains a marker. No ONNX model or network access is involved.
+    #[derive(Default)]
+    struct FakeEngine {
+        /// One entry per `embed_documents` call, holding the requested texts.
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        /// When set, any batch containing this marker fails.
+        fail_marker: Option<String>,
+        /// Vector width returned for successful embeddings.
+        dims: usize,
+    }
+
+    impl FakeEngine {
+        fn new(fail_marker: Option<&str>) -> Self {
+            Self {
+                fail_marker: fail_marker.map(str::to_string),
+                dims: 8,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl EmbeddingEngine for FakeEngine {
+        fn embed_query(&mut self, _query: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.0; self.dims])
+        }
+
+        fn embed_documents(&mut self, docs: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            calls.push(docs.iter().map(|d| (*d).to_string()).collect());
+            drop(calls);
+            if let Some(marker) = &self.fail_marker
+                && docs.iter().any(|d| d.contains(marker))
+            {
+                return Err(Error::Embedding(format!(
+                    "synthetic failure for marker {marker}"
+                )));
+            }
+            Ok(vec![vec![0.0; self.dims]; docs.len()])
+        }
+    }
+
+    /// Insert a document body into the CAS and register it under `docs/<path>`.
+    fn seed_embed_doc(qmd: &Qmd, path: &str, body: &str) {
+        let hash = hash_content(body);
+        qmd.db().insert_content(&hash, body).unwrap();
+        qmd.db().upsert_document("docs", path, path, &hash).unwrap();
+    }
 
     /// Build a fusion result for a `docs/<path>` document with `score`.
     fn search_result(path: &str, score: f64) -> SearchResult {
@@ -1058,6 +1150,157 @@ mod tests {
         assert_eq!(qmd.search_fts("orange", 10).unwrap().len(), 1);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn embed_schedules_one_job_per_content_hash_across_paths() {
+        let mut qmd = Qmd::open_memory().unwrap();
+        let shared = "# shared\nunique-token-alpha content body";
+        seed_embed_doc(&qmd, "a.md", shared);
+        seed_embed_doc(&qmd, "b.md", shared);
+        seed_embed_doc(&qmd, "c.md", "# other\nunique-token-beta content body");
+
+        let engine = FakeEngine::new(None);
+        let calls = Arc::clone(&engine.calls);
+        qmd.embedder = Some(Box::new(engine));
+
+        let result = qmd.embed().unwrap();
+
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.embedded, 2, "one job per unique content hash");
+        assert_eq!(result.remaining, 0);
+        let alpha_calls = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.iter().any(|text| text.contains("unique-token-alpha")))
+            .count();
+        assert_eq!(alpha_calls, 1, "identical content must be embedded once");
+    }
+
+    #[test]
+    fn embed_failure_alias_is_deterministic_and_preserves_hash_and_error() {
+        let mut qmd = Qmd::open_memory().unwrap();
+        let shared = "# shared\nconflict-token failure body";
+        seed_embed_doc(&qmd, "b.md", shared);
+        seed_embed_doc(&qmd, "a.md", shared);
+        let hash = hash_content(shared);
+
+        qmd.embedder = Some(Box::new(FakeEngine::new(Some("conflict-token"))));
+
+        let result = qmd.embed().unwrap();
+
+        assert_eq!(result.failures, 1);
+        assert_eq!(result.embedded, 0);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(qmd.db().vector_count().unwrap(), 0);
+        let messages = result.failure_messages.join("\n");
+        assert!(
+            messages.contains("a.md"),
+            "expected deterministic MIN(path) alias in: {messages}"
+        );
+        assert!(
+            !messages.contains("b.md"),
+            "non-deterministic alias leaked into: {messages}"
+        );
+        assert!(messages.contains(&hash), "hash missing from: {messages}");
+        assert!(
+            messages.contains("synthetic failure"),
+            "underlying error missing from: {messages}"
+        );
+    }
+
+    #[test]
+    fn embed_preserves_completed_work_when_a_later_job_fails() {
+        let mut qmd = Qmd::open_memory().unwrap();
+        let total = DEFAULT_EMBED_GROUP_SIZE + 1;
+        for i in 0..total - 1 {
+            seed_embed_doc(
+                &qmd,
+                &format!("doc-{i:04}.md"),
+                &format!("# doc {i}\ncontent number {i}"),
+            );
+        }
+        seed_embed_doc(&qmd, "last.md", "# last\ntrigger-failure marker body");
+
+        let engine = FakeEngine::new(Some("trigger-failure"));
+        let calls = Arc::clone(&engine.calls);
+        qmd.embedder = Some(Box::new(engine));
+
+        let result = qmd.embed().unwrap();
+
+        assert_eq!(result.failures, 1);
+        assert_eq!(
+            result.embedded,
+            total - 1,
+            "completed independent work must survive a later failure"
+        );
+        assert_eq!(result.remaining, 1);
+        assert_eq!(qmd.db().vector_count().unwrap(), total - 1);
+        let messages = result.failure_messages.join("\n");
+        assert!(
+            messages.contains("last.md"),
+            "affected path missing from: {messages}"
+        );
+        assert!(
+            messages.contains("synthetic failure"),
+            "underlying error missing from: {messages}"
+        );
+        assert_eq!(calls.lock().unwrap().len(), total);
+    }
+
+    #[test]
+    fn embed_batch_caps_the_total_documents_embedded() {
+        let mut qmd = Qmd::open_memory().unwrap();
+        for i in 0..5 {
+            seed_embed_doc(&qmd, &format!("cap-{i}.md"), &format!("cap body {i}"));
+        }
+        qmd.embedder = Some(Box::new(FakeEngine::new(None)));
+
+        let result = qmd.embed_with_batch(Some(2)).unwrap();
+
+        assert_eq!(
+            result.embedded, 2,
+            "--batch caps total work, not the per-group bound"
+        );
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.remaining, 3);
+        assert_eq!(qmd.db().vector_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn default_embed_group_is_declared_and_paged() {
+        let qmd = Qmd::open_memory().unwrap();
+        let total = DEFAULT_EMBED_GROUP_SIZE * 2 + 3;
+        for i in 0..total {
+            seed_embed_doc(&qmd, &format!("page-{i:04}.md"), &format!("page body {i}"));
+        }
+
+        let first = qmd
+            .db()
+            .unembedded_doc_group(DEFAULT_EMBED_GROUP_SIZE, 0)
+            .unwrap();
+        assert_eq!(first.len(), DEFAULT_EMBED_GROUP_SIZE);
+        let second = qmd
+            .db()
+            .unembedded_doc_group(DEFAULT_EMBED_GROUP_SIZE, first.last().unwrap().3)
+            .unwrap();
+        assert_eq!(second.len(), DEFAULT_EMBED_GROUP_SIZE);
+        let third = qmd
+            .db()
+            .unembedded_doc_group(DEFAULT_EMBED_GROUP_SIZE, second.last().unwrap().3)
+            .unwrap();
+        assert_eq!(third.len(), 3);
+
+        let mut hashes: Vec<&str> = first
+            .iter()
+            .chain(&second)
+            .chain(&third)
+            .map(|row| row.0.as_str())
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), total, "pages must not re-select or skip work");
     }
 }
 

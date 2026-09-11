@@ -1021,30 +1021,49 @@ impl Db {
     }
 
     /// Documents that need embedding, optionally limited for a batch run.
+    ///
+    /// Results are unique by content hash; `path` is the smallest active path
+    /// for that hash, providing a deterministic diagnostic alias.
     pub fn unembedded_docs_with_limit(
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<(String, String, String)>> {
-        let limit_clause = limit.map_or_else(String::new, |_| " LIMIT ?1".to_string());
-        let sql = format!(
-            r"SELECT DISTINCT d.hash, d.path, c.doc
+        let max = limit.unwrap_or(usize::MAX);
+        Ok(self
+            .unembedded_doc_group(max, 0)?
+            .into_iter()
+            .map(|(hash, path, body, _)| (hash, path, body))
+            .collect())
+    }
+
+    /// Fetch one bounded work group of unembedded documents.
+    ///
+    /// Rows are unique by content hash and returned as
+    /// `(hash, alias_path, body, first_document_id)`, ordered by the id of the
+    /// document that first referenced the hash. `after_first_id` pages through
+    /// the corpus without materializing or re-selecting already-fetched work.
+    pub fn unembedded_doc_group(
+        &self,
+        limit: usize,
+        after_first_id: i64,
+    ) -> Result<Vec<(String, String, String, i64)>> {
+        let bound = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = r"SELECT d.hash, MIN(d.path), c.doc, MIN(d.id)
               FROM documents d
               JOIN content c ON c.hash = d.hash
               LEFT JOIN content_vectors v
                 ON d.hash = v.hash AND v.seq = 0 AND v.model = 'default:complete'
               WHERE d.active = 1 AND v.hash IS NULL
-              ORDER BY d.id{limit_clause}"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mapper = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?));
-        let results = match limit {
-            Some(n) => stmt
-                .query_map(params![n as i64], mapper)?
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-            None => stmt
-                .query_map([], mapper)?
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        };
+              GROUP BY d.hash
+              HAVING MIN(d.id) > ?1
+              ORDER BY MIN(d.id)
+              LIMIT ?2";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mapper =
+            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+        let results = stmt
+            .query_map(params![after_first_id, bound], mapper)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(results)
     }
 
@@ -2002,6 +2021,24 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(db.unembedded_docs_with_limit(Some(2)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unembedded_docs_deduplicate_hash_across_paths() {
+        let db = mem_db();
+        let body = "shared identical body";
+        let hash = hash_content(body);
+        db.insert_content(&hash, body).unwrap();
+        db.upsert_document("docs", "b.md", "B", &hash).unwrap();
+        db.upsert_document("docs", "a.md", "A", &hash).unwrap();
+
+        let docs = db.unembedded_docs().unwrap();
+        assert_eq!(docs.len(), 1, "one work item per unique content hash");
+        assert_eq!(docs[0].0, hash);
+        assert_eq!(
+            docs[0].1, "a.md",
+            "alias must be the deterministic MIN(path)"
+        );
     }
 
     #[test]
