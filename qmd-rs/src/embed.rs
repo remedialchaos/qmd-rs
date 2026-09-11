@@ -44,6 +44,29 @@ fn batch_ranges(len: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+/// Narrow engine seam for embedding work.
+///
+/// Production uses [`Embedder`]; the trait exists so embedding scheduling and
+/// failure handling can be exercised deterministically without loading an ONNX
+/// model or touching the network.
+pub trait EmbeddingEngine {
+    /// Embed a single query string.
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>>;
+
+    /// Embed a batch of document texts.
+    fn embed_documents(&mut self, docs: &[&str]) -> Result<Vec<Vec<f32>>>;
+}
+
+impl EmbeddingEngine for Embedder {
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        Self::embed_query(self, query)
+    }
+
+    fn embed_documents(&mut self, docs: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Self::embed_documents(self, docs)
+    }
+}
+
 /// Text embedding engine.
 pub struct Embedder {
     /// Underlying fastembed model.

@@ -345,10 +345,27 @@ fn cmd_embed(index: &Path, force: bool, batch: Option<usize>) -> qmd_rs::Result<
     for message in &r.failure_messages {
         eprintln!("{message}");
     }
+    embed_report(r.embedded, r.chunks, r.remaining, r.failures)
+}
+
+/// Print embed totals and return an error when any job failed.
+///
+/// Partial progress is reported as-is; a failure is never silently treated as
+/// success, so `qmd embed` exits nonzero.
+fn embed_report(
+    embedded: usize,
+    chunks: usize,
+    remaining: usize,
+    failures: usize,
+) -> qmd_rs::Result<()> {
     println!(
-        "{} documents embedded, {} chunks; {} remaining; {} failures",
-        r.embedded, r.chunks, r.remaining, r.failures
+        "{embedded} documents embedded, {chunks} chunks; {remaining} remaining; {failures} failures"
     );
+    if failures > 0 {
+        return Err(qmd_rs::Error::Config(format!(
+            "{failures} embedding jobs failed; {embedded} documents ({chunks} chunks) published and {remaining} documents still need embedding"
+        )));
+    }
     Ok(())
 }
 
@@ -551,6 +568,31 @@ mod tests {
 
     fn test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("qmd-cli-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn embed_report_fails_and_preserves_totals_when_jobs_fail() {
+        let ok = embed_report(4, 9, 0, 0);
+        assert!(ok.is_ok(), "clean run must succeed: {ok:?}");
+
+        let err = embed_report(2, 5, 3, 1).expect_err("partial failure must exit nonzero");
+        let message = err.to_string();
+        assert!(
+            message.contains("1 embedding job"),
+            "failure count missing: {message}"
+        );
+        assert!(
+            message.contains("2 documents"),
+            "published total missing: {message}"
+        );
+        assert!(
+            message.contains("5 chunks"),
+            "chunk total missing: {message}"
+        );
+        assert!(
+            message.contains("3 documents"),
+            "remaining total missing: {message}"
+        );
     }
 
     #[test]
