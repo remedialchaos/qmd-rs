@@ -1077,36 +1077,6 @@ impl Db {
 
         let vec_bytes = query_embedding.as_bytes();
 
-        let sql = if collection.is_some() {
-            if self.vector_count()? == 0 {
-                return Ok(Vec::new());
-            }
-            // Rank only active documents in the selected collection. Native KNN
-            // caps k at 4096 and truncates ties before our document ordering.
-            // Scalar L2 matches vec0's default metric without either limitation.
-            r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
-                     LENGTH(c.doc), vec_distance_L2(ve.embedding, ?1) AS distance
-              FROM documents d
-              JOIN content_vectors cv ON cv.hash = d.hash
-              JOIN vec_embeddings ve ON ve.rowid = cv.rowid
-              JOIN content c ON c.hash = d.hash
-              WHERE d.active = 1 AND d.collection = ?3
-              ORDER BY distance, d.collection, d.path, d.hash
-              LIMIT ?2"
-        } else {
-            r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
-                     LENGTH(c.doc), ve.distance
-              FROM vec_embeddings ve
-              JOIN content_vectors cv ON cv.rowid = ve.rowid
-              JOIN documents d ON d.hash = cv.hash AND d.active = 1
-              JOIN content c ON c.hash = d.hash
-              WHERE ve.embedding MATCH ?1
-                AND k = ?2
-              ORDER BY ve.distance, d.collection, d.path, d.hash"
-        };
-
-        let mut stmt = self.conn.prepare(sql)?;
-
         let map_row = |row: &rusqlite::Row<'_>| {
             let body_len: i64 = row.get(5)?;
             let distance: f64 = row.get(6)?;
@@ -1126,14 +1096,58 @@ impl Db {
             })
         };
 
-        let mut results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![vec_bytes, limit as i64, coll], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map(params![vec_bytes, limit as i64], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        results.truncate(limit);
+        if let Some(coll) = collection {
+            if self.vector_count()? == 0 {
+                return Ok(Vec::new());
+            }
+            // Rank only active documents in the selected collection, one row
+            // per (collection, path) keeping each document's best chunk by
+            // distance, so duplicates cannot crowd out distinct documents
+            // before the requested limit. Native KNN caps k at 4096 and
+            // truncates ties before our document ordering; scalar L2 matches
+            // vec0's default metric without either limitation.
+            let scoped_sql = r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
+                     LENGTH(c.doc), MIN(vec_distance_L2(ve.embedding, ?1)) AS distance
+              FROM documents d
+              JOIN content_vectors cv ON cv.hash = d.hash
+              JOIN vec_embeddings ve ON ve.rowid = cv.rowid
+              JOIN content c ON c.hash = d.hash
+              WHERE d.active = 1 AND d.collection = ?3
+              GROUP BY d.collection, d.path
+              ORDER BY distance, d.collection, d.path, d.hash
+              LIMIT ?2";
+            let mut stmt = self.conn.prepare(scoped_sql)?;
+            let mut results: Vec<SearchResult> = stmt
+                .query_map(params![vec_bytes, limit as i64, coll], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            results.truncate(limit);
+            return Ok(results);
+        }
+
+        // Unscoped search uses the same exact active-document scalar L2
+        // aggregation. Native KNN is not usable here: it caps k at 4096 and
+        // truncates ties before active filtering or document aggregation, so
+        // inactive or duplicate chunk rows can crowd distinct active
+        // documents out of any fixed window. Exact aggregation over active
+        // documents satisfies the contract without an oversampling constant
+        // or best-effort cap. Performance optimization is deferred.
+        if self.vector_count()? == 0 {
+            return Ok(Vec::new());
+        }
+        let unscoped_sql = r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
+                     LENGTH(c.doc), MIN(vec_distance_L2(ve.embedding, ?1)) AS distance
+              FROM documents d
+              JOIN content_vectors cv ON cv.hash = d.hash
+              JOIN vec_embeddings ve ON ve.rowid = cv.rowid
+              JOIN content c ON c.hash = d.hash
+              WHERE d.active = 1
+              GROUP BY d.collection, d.path
+              ORDER BY distance, d.collection, d.path, d.hash
+              LIMIT ?2";
+        let mut stmt = self.conn.prepare(unscoped_sql)?;
+        let results: Vec<SearchResult> = stmt
+            .query_map(params![vec_bytes, limit as i64], map_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(results)
     }
@@ -2225,6 +2239,44 @@ mod tests {
     }
 
     #[test]
+    fn collection_vector_search_returns_each_document_once_before_limit() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        // Two nearby chunks in one document and one chunk in another; a limit
+        // of 2 must surface each (collection, path) exactly once, with the
+        // duplicate-chunk document not crowding out the other document.
+        for (path, vector) in [("dup.md", [0.05f32, 0.0]), ("other.md", [0.2, 0.0])] {
+            let hash = hash_content(path);
+            db.insert_content(&hash, path).unwrap();
+            db.upsert_document("docs", path, path, &hash).unwrap();
+            db.insert_embedding_with_fingerprint(&hash, 0, 0, &vector, "default", &fingerprint)
+                .unwrap();
+        }
+        let dup = hash_content("dup.md");
+        db.insert_embedding_with_fingerprint(&dup, 1, 0, &[0.1, 0.0], "default", &fingerprint)
+            .unwrap();
+
+        let hits = db
+            .search_vec_with_fingerprint(&[0.0, 0.0], 2, Some("docs"), &fingerprint)
+            .unwrap();
+        let identities: Vec<(String, String)> = hits
+            .iter()
+            .map(|h| (h.doc.collection.clone(), h.doc.path.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                ("docs".to_string(), "dup.md".to_string()),
+                ("docs".to_string(), "other.md".to_string()),
+            ],
+            "each document identity must appear at most once: {identities:?}"
+        );
+        // Best (nearest) chunk of each document is retained.
+        assert!((hits[0].score - 0.95).abs() < 1e-6);
+        assert!((hits[1].score - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
     fn collection_vector_search_filters_before_limit_and_preserves_limit() {
         let mut db = mem_db();
         let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
@@ -2292,6 +2344,145 @@ mod tests {
         );
         assert_eq!(db.vector_count().unwrap(), 4097);
         assert_eq!(db.doc_count().unwrap(), 4098);
+    }
+
+    #[test]
+    fn unscoped_vector_search_returns_one_result_per_document_identity() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        let alpha = hash_content("alpha");
+        let beta = hash_content("beta");
+        db.insert_content(&alpha, "alpha").unwrap();
+        db.upsert_document("docs", "alpha.md", "alpha", &alpha)
+            .unwrap();
+        db.insert_content(&beta, "beta").unwrap();
+        db.upsert_document("docs", "beta.md", "beta", &beta)
+            .unwrap();
+        for (seq, vector) in [(0usize, [0.1f32, 0.0]), (1, [0.12, 0.0]), (2, [0.9, 0.0])] {
+            db.insert_embedding_with_fingerprint(&alpha, seq, 0, &vector, "default", &fingerprint)
+                .unwrap();
+        }
+        db.insert_embedding_with_fingerprint(&beta, 0, 0, &[0.2, 0.0], "default", &fingerprint)
+            .unwrap();
+
+        let hits = db
+            .search_vec_with_fingerprint(&[0.0, 0.0], 2, None, &fingerprint)
+            .unwrap();
+        let identities: Vec<(String, String)> = hits
+            .iter()
+            .map(|h| (h.doc.collection.clone(), h.doc.path.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                ("docs".to_string(), "alpha.md".to_string()),
+                ("docs".to_string(), "beta.md".to_string())
+            ],
+            "each document identity must appear at most once: {identities:?}"
+        );
+        // The best (nearest) chunk of each document is retained.
+        assert!((hits[0].score - 0.9).abs() < 1e-6);
+        assert!((hits[1].score - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unscoped_vector_search_does_not_lose_active_docs_behind_inactive_rows() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        let inactive = hash_content("inactive");
+        let active = hash_content("active");
+        db.insert_content(&inactive, "inactive").unwrap();
+        db.upsert_document("docs", "inactive.md", "inactive", &inactive)
+            .unwrap();
+        db.insert_content(&active, "active").unwrap();
+        db.upsert_document("docs", "active.md", "active", &active)
+            .unwrap();
+        db.insert_embedding_with_fingerprint(&inactive, 0, 0, &[0.0, 0.0], "default", &fingerprint)
+            .unwrap();
+        db.insert_embedding_with_fingerprint(&active, 0, 0, &[0.5, 0.0], "default", &fingerprint)
+            .unwrap();
+        db.deactivate("docs", "inactive.md").unwrap();
+
+        let hits = db
+            .search_vec_with_fingerprint(&[0.0, 0.0], 1, None, &fingerprint)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "active document must not be lost: {hits:?}");
+        assert_eq!(hits[0].doc.path, "active.md");
+    }
+
+    #[test]
+    fn unscoped_vector_search_exact_over_inactive_rows_beyond_native_cap() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        let inactive = hash_content("inactive");
+        let active = hash_content("active");
+        db.insert_content(&inactive, "inactive").unwrap();
+        db.upsert_document("docs", "inactive.md", "inactive", &inactive)
+            .unwrap();
+        db.insert_content(&active, "active").unwrap();
+        db.upsert_document("docs", "active.md", "active", &active)
+            .unwrap();
+        db.insert_embedding_with_fingerprint(&inactive, 0, 0, &[0.0, 0.0], "default", &fingerprint)
+            .unwrap();
+        db.insert_embedding_with_fingerprint(&active, 0, 0, &[0.5, 0.0], "default", &fingerprint)
+            .unwrap();
+        // More nearer rows than sqlite-vec's native k cap of 4096, all tied to
+        // an inactive document. Only an exact active-document aggregation —
+        // not a capped KNN window at any size — can satisfy limit 1 here.
+        for seq in 1..4097 {
+            db.insert_embedding_with_fingerprint(
+                &inactive,
+                seq,
+                0,
+                &[0.0, 0.0],
+                "default",
+                &fingerprint,
+            )
+            .unwrap();
+        }
+        db.deactivate("docs", "inactive.md").unwrap();
+        let embedding_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM vec_embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(embedding_rows, 4098, "beyond the native k = 4096 cap");
+
+        let hits = db
+            .search_vec_with_fingerprint(&[0.0, 0.0], 1, None, &fingerprint)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "active document must not be lost: {hits:?}");
+        assert_eq!(hits[0].doc.path, "active.md");
+        assert!((hits[0].score - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vector_search_limit_zero_is_empty_after_aggregation() {
+        let mut db = mem_db();
+        let fingerprint = crate::embed::embedding_fingerprint(2, 3200, 480);
+        let hash = hash_content("doc");
+        db.insert_content(&hash, "doc").unwrap();
+        db.upsert_document("docs", "doc.md", "doc", &hash).unwrap();
+        for seq in 0..2 {
+            db.insert_embedding_with_fingerprint(
+                &hash,
+                seq,
+                0,
+                &[0.1, 0.0],
+                "default",
+                &fingerprint,
+            )
+            .unwrap();
+        }
+        assert!(
+            db.search_vec_with_fingerprint(&[0.0, 0.0], 0, None, &fingerprint)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.search_vec_with_fingerprint(&[0.0, 0.0], 0, Some("docs"), &fingerprint)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
