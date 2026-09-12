@@ -393,7 +393,9 @@ impl Qmd {
         offset: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let fts_query = search::build_fts5_query(query).unwrap_or_else(|| query.to_string());
+        let Some(fts_query) = search::build_fts5_query(query) else {
+            return Ok(Vec::new());
+        };
         self.db
             .search_fts_with_offset(&fts_query, limit, offset, collection)
     }
@@ -784,6 +786,18 @@ mod tests {
     use crate::error::{Error, Result};
     use crate::rerank::Scored;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn direct_fts_punctuation_only_query_returns_no_hits() {
+        let qmd = Qmd::open_memory().expect("open in-memory qmd");
+        seed_embed_doc(&qmd, "punctuation.md", "ordinary searchable content");
+
+        let results = qmd
+            .search_fts("!!! --- ...", 10)
+            .expect("punctuation-only FTS query should be safe");
+
+        assert!(results.is_empty());
+    }
 
     /// Deterministic test double for the embedding engine: records every
     /// document batch it is asked to embed and can fail any batch whose text
