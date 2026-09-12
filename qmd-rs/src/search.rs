@@ -126,12 +126,27 @@ impl<'de> serde::Deserialize<'de> for QueryType {
     }
 }
 
-/// Sanitize a term for FTS5 (keep only alphanumeric + apostrophes).
+/// Normalize a term to the FTS5 tokenizer's own boundaries.
+///
+/// The index is built with the `porter unicode61` tokenizer, which splits on
+/// every non-alphanumeric character. Deleting those separators here would glue
+/// a multi-part identifier such as `qmd-rs` into the single token `qmdrs`,
+/// which can never match an indexed `qmd` + `rs`. Replace each separator run
+/// with a single space instead, so the emitted query keeps the same token
+/// boundaries the tokenizer produced at index time.
 fn sanitize_fts5_term(term: &str) -> String {
-    term.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '\'')
-        .collect::<String>()
-        .to_lowercase()
+    let mut normalized = String::with_capacity(term.len());
+    for ch in term.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+        } else if !normalized.is_empty() && !normalized.ends_with(' ') {
+            normalized.push(' ');
+        }
+    }
+    if normalized.ends_with(' ') {
+        normalized.pop();
+    }
+    normalized
 }
 
 /// Build an FTS5 query from user-facing search syntax.
@@ -334,7 +349,98 @@ pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_snippet, rrf};
+    #![allow(clippy::expect_used)]
+    use super::{build_fts5_query, extract_snippet, rrf};
+    use rusqlite::Connection;
+
+    /// Build an in-memory FTS5 fixture that mirrors the production index
+    /// tokenizer so query building is exercised end to end.
+    fn fixture(docs: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='porter unicode61');",
+        )
+        .expect("create fts5 fixture");
+        {
+            let mut insert = conn
+                .prepare("INSERT INTO docs(body) VALUES (?1)")
+                .expect("prepare insert");
+            for doc in docs {
+                insert.execute([doc]).expect("seed fixture");
+            }
+        }
+        conn
+    }
+
+    /// Run the production query builder against the fixture and return the
+    /// bodies of matching documents in rowid order.
+    fn matching(query: &str, docs: &[&str]) -> Vec<String> {
+        let conn = fixture(docs);
+        let built = build_fts5_query(query).expect("query builder must yield a usable query");
+        let mut stmt = conn
+            .prepare("SELECT body FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+            .expect("prepare match");
+        let rows = stmt
+            .query_map([built], |row| row.get::<_, String>(0))
+            .expect("run match");
+        rows.map(|row| row.expect("row")).collect()
+    }
+
+    #[test]
+    fn hyphenated_identifier_matches_the_document_that_contains_it() {
+        let docs = ["qmd-rs is the CLI", "an unrelated document"];
+
+        assert_eq!(matching("qmd-rs", &docs), ["qmd-rs is the CLI"]);
+    }
+
+    #[test]
+    fn path_like_input_and_extension_match_their_token_boundaries() {
+        let docs = ["see qmd-rs/src/search.rs for details", "a different file"];
+
+        assert_eq!(
+            matching("qmd-rs/src/search.rs", &docs),
+            ["see qmd-rs/src/search.rs for details"]
+        );
+        assert_eq!(
+            matching("search.rs", &docs),
+            ["see qmd-rs/src/search.rs for details"]
+        );
+    }
+
+    #[test]
+    fn version_like_token_matches_its_token_boundaries() {
+        let docs = ["released v1.2.3 today", "released v123 today"];
+
+        assert_eq!(matching("v1.2.3", &docs), ["released v1.2.3 today"]);
+    }
+
+    #[test]
+    fn quoted_phrase_matches_across_separator_boundaries() {
+        let docs = ["qmd-rs is the CLI", "qmd plus rs elsewhere"];
+
+        assert_eq!(matching("\"qmd-rs\"", &docs), ["qmd-rs is the CLI"]);
+    }
+
+    #[test]
+    fn established_grammar_and_safe_failure_are_preserved() {
+        assert_eq!(
+            build_fts5_query("performance -sports"),
+            Some(r#""performance"* NOT "sports"*"#.to_string())
+        );
+        assert_eq!(build_fts5_query("perf"), Some(r#""perf"*"#.to_string()));
+        assert_eq!(build_fts5_query("   "), None);
+        assert_eq!(build_fts5_query("!!! --- ..."), None);
+        assert_eq!(build_fts5_query("\"\""), None);
+    }
+
+    #[test]
+    fn unicode_letters_numbers_and_apostrophes_still_match() {
+        let docs = ["café 東京 don't stop"];
+
+        assert_eq!(matching("café", &docs), ["café 東京 don't stop"]);
+        assert_eq!(matching("東京", &docs), ["café 東京 don't stop"]);
+        assert_eq!(matching("don't", &docs), ["café 東京 don't stop"]);
+    }
 
     #[test]
     #[allow(clippy::panic)]
