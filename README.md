@@ -122,6 +122,16 @@ deterministic fusion without downloading a model:
 cargo test -p qmd-rs --test retrieval_quality
 ```
 
+## Reliability improvements
+
+Recent releases include safeguards that keep indexing and retrieval predictable:
+
+- Search snippets are Unicode-safe and never exceed the requested character bound, including when a match is surrounded by multibyte text.
+- Full-text queries preserve the tokenizer's punctuation boundaries, so identifiers and paths keep their searchable terms; punctuation-only queries produce no direct FTS hits.
+- During `qmd update`, a tracked Markdown file that becomes empty or whitespace-only is deactivated rather than left searchable as stale content.
+- Vector candidate selection returns each active document at most once, even when a document has multiple matching chunks, and reciprocal-rank fusion suppresses duplicate votes within each ranked list.
+- Embedding work runs in bounded groups and supports a per-run `--batch` cap. Completed groups are published independently, while embedding failures are reported by the CLI and make the command fail instead of being treated as success.
+
 ## License
 
 Licensed under either of:
