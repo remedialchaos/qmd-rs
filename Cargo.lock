@@ -1784,6 +1784,7 @@ dependencies = [
  "sha2",
  "sqlite-vec",
  "thiserror",
+ "ureq 2.12.1",
  "zerocopy",
 ]
 

@@ -25,6 +25,7 @@ pub mod chunk;
 pub mod db;
 pub mod embed;
 pub mod error;
+pub mod llm;
 pub mod qmd;
 pub mod rerank;
 pub mod search;
@@ -34,6 +35,7 @@ pub use db::{
     DocumentSummary, EmbeddingCompatibility, IndexStatus, SearchResult, SearchSource, hash_content,
 };
 pub use error::{Error, Result};
+pub use llm::{LlmConfig, LlmProvider, expand_query, parse_or_expand_query};
 pub use qmd::{
     EmbedResult, IndexFailure, IndexResult, MultiGetItem, Qmd, UpdateResult, parse_path_range,
     slice_body,
