@@ -12,6 +12,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use ignore::WalkBuilder;
@@ -19,8 +20,8 @@ use ignore::gitignore::GitignoreBuilder;
 
 use crate::chunk::Chunker;
 use crate::db::{
-    Collection, CollectionInfo, Db, DoctorReport, Document, IndexStatus, SearchResult,
-    extract_title, hash_content,
+    Collection, CollectionInfo, Db, DoctorReport, Document, DocumentSummary, IndexStatus,
+    SearchResult, extract_title, hash_content,
 };
 use crate::embed::{Embedder, EmbeddingEngine, default_embedding_fingerprint_with_chunker};
 use crate::error::{Error, Result};
@@ -57,6 +58,84 @@ impl std::fmt::Debug for Qmd {
 /// size, so it never retains a whole corpus of documents or all generated
 /// vectors at once.
 pub const DEFAULT_EMBED_GROUP_SIZE: usize = 32;
+
+/// Result item for multi-get batch retrieval.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MultiGetItem {
+    /// Document ID (first 6 hex chars of hash).
+    pub docid: String,
+    /// Collection name.
+    pub collection: String,
+    /// Collection-relative path.
+    pub path: String,
+    /// Document title.
+    pub title: String,
+    /// Document content body (if not skipped).
+    pub body: Option<String>,
+    /// Total byte length of document body.
+    pub body_len: usize,
+    /// Whether the document was skipped because it exceeded max_bytes.
+    pub skipped: bool,
+    /// Reason for skip, if skipped.
+    pub skip_reason: Option<String>,
+}
+
+/// Parse path range such as "wiki/page.md:50:20" or "#abc123:100" into (clean_path, from_line, max_lines).
+#[must_use]
+pub fn parse_path_range(input: &str) -> (&str, Option<usize>, Option<usize>) {
+    if let Some(idx) = input.rfind(':') {
+        let suffix = &input[idx + 1..];
+        if let Ok(count) = suffix.parse::<usize>() {
+            let rest = &input[..idx];
+            if let Some(first_idx) = rest.rfind(':') {
+                let first_suffix = &rest[first_idx + 1..];
+                if let Ok(from) = first_suffix.parse::<usize>() {
+                    return (&rest[..first_idx], Some(from), Some(count));
+                }
+            }
+            return (rest, Some(count), None);
+        }
+    }
+    (input, None, None)
+}
+
+/// Slice a document's body lines and optionally format with line numbers.
+#[must_use]
+pub fn slice_body(
+    body: &str,
+    from_line: Option<usize>,
+    max_lines: Option<usize>,
+    line_numbers: bool,
+) -> (String, usize, usize, usize) {
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len();
+    let start = from_line.unwrap_or(1).saturating_sub(1);
+    if start >= total {
+        return (String::new(), start + 1, 0, total);
+    }
+    let end = match max_lines {
+        Some(count) => (start + count).min(total),
+        None => total,
+    };
+    let slice = &lines[start..end];
+    let returned_count = slice.len();
+
+    if line_numbers {
+        let width = end.to_string().len().max(3);
+        let mut formatted = String::new();
+        for (i, line) in slice.iter().enumerate() {
+            let line_num = start + 1 + i;
+            let _ = writeln!(formatted, "{line_num:>width$} | {line}");
+        }
+        if formatted.ends_with('\n') {
+            formatted.pop();
+        }
+        (formatted, start + 1, returned_count, total)
+    } else {
+        (slice.join("\n"), start + 1, returned_count, total)
+    }
+}
 
 impl Qmd {
     /// Open (or create) a qmd index at the given SQLite path.
@@ -402,13 +481,55 @@ impl Qmd {
 
     /// Vector similarity search.
     pub fn search_vec(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_vec_with_offset_in_collection(query, limit, 0, None)
+    }
+
+    /// Vector similarity search with offset pagination and collection scope.
+    pub fn search_vec_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let fingerprint = self.current_embedding_fingerprint();
         self.db.validate_embedding_fingerprint(&fingerprint)?;
         self.ensure_embedder()?;
         let embedder = self.embedder.as_mut().unwrap_or_else(|| unreachable!());
         let emb = embedder.embed_query(query)?;
-        self.db
-            .search_vec_with_fingerprint(&emb, limit, None, &fingerprint)
+        self.db.search_vec_with_offset_and_fingerprint(
+            &emb,
+            limit,
+            offset,
+            collection,
+            &fingerprint,
+        )
+    }
+
+    /// Hybrid search: FTS + vector + RRF + reranking (alias for `search`).
+    pub fn query(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, limit)
+    }
+
+    /// Hybrid search with offset pagination (alias for `search_with_offset`).
+    pub fn query_with_offset(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_offset(query, limit, offset)
+    }
+
+    /// Hybrid search with offset pagination in collection (alias for `search_with_offset_in_collection`).
+    pub fn query_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_offset_in_collection(query, limit, offset, collection)
     }
 
     /// Hybrid search: FTS + vector + RRF fusion + optional reranking.
@@ -604,6 +725,104 @@ impl Qmd {
                 .ok_or_else(|| Error::NotFound(path_or_docid.to_string()));
         }
         Err(Error::NotFound(path_or_docid.to_string()))
+    }
+
+    /// List active documents, optionally filtered by collection and subpath prefix.
+    pub fn ls(
+        &self,
+        collection: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>> {
+        self.db.list_active_documents(collection, path_prefix)
+    }
+
+    /// Batch retrieve documents by glob pattern or comma-separated list.
+    pub fn multi_get(&self, pattern: &str, max_bytes: usize) -> Result<Vec<MultiGetItem>> {
+        let is_comma = pattern.contains(',')
+            && !pattern.contains('*')
+            && !pattern.contains('?')
+            && !pattern.contains('[');
+        let mut results = Vec::new();
+
+        if is_comma {
+            let names: Vec<&str> = pattern
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            for name in names {
+                let (clean_path, _, _) = parse_path_range(name);
+                let Ok(doc) = self.get(clean_path) else {
+                    continue;
+                };
+                let body_len = doc.body_len;
+                let docid = doc.docid().to_string();
+                if body_len > max_bytes {
+                    results.push(MultiGetItem {
+                        docid,
+                        collection: doc.collection,
+                        path: doc.path,
+                        title: doc.title,
+                        body: None,
+                        body_len,
+                        skipped: true,
+                        skip_reason: Some(format!("exceeds max-bytes ({body_len} > {max_bytes})")),
+                    });
+                } else {
+                    results.push(MultiGetItem {
+                        docid,
+                        collection: doc.collection,
+                        path: doc.path,
+                        title: doc.title,
+                        body: doc.body,
+                        body_len,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
+            }
+        } else {
+            let glob = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| Error::Config(e.to_string()))?
+                .compile_matcher();
+
+            let all_docs = self.db.get_all_active_documents()?;
+            for doc in all_docs {
+                let full_virtual = format!("{}/{}", doc.collection, doc.path);
+                if glob.is_match(&full_virtual) || glob.is_match(&doc.path) {
+                    let body_len = doc.body_len;
+                    let docid = doc.docid().to_string();
+                    if body_len > max_bytes {
+                        results.push(MultiGetItem {
+                            docid,
+                            collection: doc.collection,
+                            path: doc.path,
+                            title: doc.title,
+                            body: None,
+                            body_len,
+                            skipped: true,
+                            skip_reason: Some(format!(
+                                "exceeds max-bytes ({body_len} > {max_bytes})"
+                            )),
+                        });
+                    } else {
+                        results.push(MultiGetItem {
+                            docid,
+                            collection: doc.collection,
+                            path: doc.path,
+                            title: doc.title,
+                            body: doc.body,
+                            body_len,
+                            skipped: false,
+                            skip_reason: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     // ── Index health ────────────────────────────────────────────────────
@@ -1315,6 +1534,61 @@ mod tests {
         hashes.sort_unstable();
         hashes.dedup();
         assert_eq!(hashes.len(), total, "pages must not re-select or skip work");
+    }
+
+    #[test]
+    fn parse_path_range_parses_various_forms() {
+        assert_eq!(
+            super::parse_path_range("wiki/page.md"),
+            ("wiki/page.md", None, None)
+        );
+        assert_eq!(
+            super::parse_path_range("wiki/page.md:10"),
+            ("wiki/page.md", Some(10), None)
+        );
+        assert_eq!(
+            super::parse_path_range("wiki/page.md:10:20"),
+            ("wiki/page.md", Some(10), Some(20))
+        );
+        assert_eq!(
+            super::parse_path_range("#abc123:5:15"),
+            ("#abc123", Some(5), Some(15))
+        );
+    }
+
+    #[test]
+    fn slice_body_handles_ranges_and_line_numbers() {
+        let text = "line 1\nline 2\nline 3\nline 4\nline 5";
+        let (sliced, from, returned, total) = super::slice_body(text, Some(2), Some(2), false);
+        assert_eq!(sliced, "line 2\nline 3");
+        assert_eq!(from, 2);
+        assert_eq!(returned, 2);
+        assert_eq!(total, 5);
+
+        let (sliced_nums, _, _, _) = super::slice_body(text, Some(2), Some(2), true);
+        assert!(sliced_nums.contains("2 | line 2"));
+        assert!(sliced_nums.contains("3 | line 3"));
+    }
+
+    #[test]
+    fn multi_get_and_ls_work() {
+        let qmd = Qmd::open_memory().unwrap();
+        seed_embed_doc(&qmd, "a.md", "# Doc A\nBody of doc a");
+        seed_embed_doc(&qmd, "sub/b.md", "# Doc B\nBody of doc b");
+
+        let ls_all = qmd.ls(Some("docs"), None).unwrap();
+        assert_eq!(ls_all.len(), 2);
+
+        let ls_sub = qmd.ls(Some("docs"), Some("sub")).unwrap();
+        assert_eq!(ls_sub.len(), 1);
+        assert_eq!(ls_sub[0].path, "sub/b.md");
+
+        let multi = qmd.multi_get("docs/*.md", 100_000).unwrap();
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi[0].path, "a.md");
+
+        let multi_csv = qmd.multi_get("docs/a.md, docs/sub/b.md", 100_000).unwrap();
+        assert_eq!(multi_csv.len(), 2);
     }
 }
 

@@ -31,8 +31,11 @@ pub mod search;
 
 pub use db::{
     Collection, CollectionInfo, DoctorCheck, DoctorCheckStatus, DoctorReport, Document,
-    EmbeddingCompatibility, IndexStatus, SearchResult, SearchSource, hash_content,
+    DocumentSummary, EmbeddingCompatibility, IndexStatus, SearchResult, SearchSource, hash_content,
 };
 pub use error::{Error, Result};
-pub use qmd::{EmbedResult, IndexFailure, IndexResult, Qmd, UpdateResult};
+pub use qmd::{
+    EmbedResult, IndexFailure, IndexResult, MultiGetItem, Qmd, UpdateResult, parse_path_range,
+    slice_body,
+};
 pub use search::{Query, QueryType};

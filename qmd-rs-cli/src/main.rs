@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use qmd_rs::{Collection, DoctorCheckStatus, Qmd};
+use qmd_rs::{Collection, DoctorCheckStatus, Qmd, parse_path_range, slice_body};
 
 /// QMD — local search engine for markdown files.
 #[derive(Parser)]
@@ -48,7 +48,8 @@ enum Command {
         #[arg(long)]
         batch: Option<usize>,
     },
-    /// Hybrid search (FTS + vector + RRF + rerank).
+    /// Full-text keyword search (BM25 only).
+    #[command(alias = "fts")]
     Search {
         /// Search query.
         query: String,
@@ -62,11 +63,15 @@ enum Command {
         #[arg(long, default_value = "0")]
         offset: usize,
         /// Restrict results to this collection.
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         collection: Option<String>,
+        /// Run hybrid search instead of pure FTS.
+        #[arg(long)]
+        hybrid: bool,
     },
-    /// Full-text keyword search (BM25 only).
-    Fts {
+    /// Vector similarity search (semantic).
+    #[command(alias = "vector-search", alias = "v-search")]
+    Vsearch {
         /// Search query.
         query: String,
         /// Max results.
@@ -79,13 +84,72 @@ enum Command {
         #[arg(long, default_value = "0")]
         offset: usize,
         /// Restrict results to this collection.
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         collection: Option<String>,
     },
-    /// Get a document by collection/path or #docid.
+    /// Hybrid search (FTS + vector + RRF + rerank).
+    #[command(alias = "deep-search")]
+    Query {
+        /// Search query.
+        query: String,
+        /// Max results.
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Number of matching results to skip.
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Restrict results to this collection.
+        #[arg(short = 'c', long)]
+        collection: Option<String>,
+    },
+    /// List indexed documents in a collection or show collections overview.
+    Ls {
+        /// Collection name or collection/subpath prefix (e.g. "wiki" or "wiki/concepts").
+        path: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get a document by path or #docid, with optional line range.
     Get {
-        /// Path (collection/file.md) or docid (#abc123).
+        /// Path (collection/file.md) or docid (#abc123), optionally with :from:count.
         path: String,
+        /// Start line (1-indexed). Overrides line parsed from path.
+        #[arg(long)]
+        from: Option<usize>,
+        /// Maximum number of lines to return. Overrides count parsed from path.
+        #[arg(short = 'l', long = "lines")]
+        lines: Option<usize>,
+        /// Prefix lines with line numbers.
+        #[arg(long)]
+        line_numbers: bool,
+        /// Disable line numbering.
+        #[arg(long)]
+        no_line_numbers: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Batch retrieve documents by glob pattern or comma-separated list.
+    #[command(name = "multi-get")]
+    MultiGet {
+        /// Glob pattern (e.g. 'wiki/concepts/*.md') or comma-separated list of paths or docids.
+        pattern: String,
+        /// Maximum number of lines per file.
+        #[arg(short = 'l', long = "lines")]
+        lines: Option<usize>,
+        /// Skip files larger than this byte size (default: 65536).
+        #[arg(long, default_value = "65536")]
+        max_bytes: usize,
+        /// Prefix lines with line numbers.
+        #[arg(long)]
+        line_numbers: bool,
+        /// Disable line numbering.
+        #[arg(long)]
+        no_line_numbers: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -211,15 +275,63 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
             json,
             offset,
             collection,
-        } => cmd_search(index, &query, limit, offset, collection.as_deref(), json),
-        Command::Fts {
+            hybrid,
+        } => cmd_search(
+            index,
+            &query,
+            limit,
+            offset,
+            collection.as_deref(),
+            json,
+            hybrid,
+        ),
+        Command::Vsearch {
             query,
             limit,
             json,
             offset,
             collection,
-        } => cmd_fts(index, &query, limit, offset, collection.as_deref(), json),
-        Command::Get { path, json } => cmd_get(index, &path, json),
+        } => cmd_vsearch(index, &query, limit, offset, collection.as_deref(), json),
+        Command::Query {
+            query,
+            limit,
+            json,
+            offset,
+            collection,
+        } => cmd_query(index, &query, limit, offset, collection.as_deref(), json),
+        Command::Ls { path, json } => cmd_ls(index, path.as_deref(), json),
+        Command::Get {
+            path,
+            from,
+            lines,
+            line_numbers,
+            no_line_numbers,
+            json,
+        } => cmd_get(
+            index,
+            &path,
+            from,
+            lines,
+            line_numbers,
+            no_line_numbers,
+            json,
+        ),
+        Command::MultiGet {
+            pattern,
+            lines,
+            max_bytes,
+            line_numbers,
+            no_line_numbers,
+            json,
+        } => cmd_multi_get(
+            index,
+            &pattern,
+            lines,
+            max_bytes,
+            line_numbers,
+            no_line_numbers,
+            json,
+        ),
         Command::Status { json } => cmd_status(index, json),
         Command::Doctor { json } => cmd_doctor(index, json),
         Command::Context { action } => cmd_context(index, action),
@@ -376,28 +488,20 @@ fn cmd_search(
     offset: usize,
     collection: Option<&str>,
     json: bool,
+    hybrid: bool,
 ) -> qmd_rs::Result<()> {
-    let mut qmd = Qmd::open(index)?;
-    let results = qmd.search_with_offset_in_collection(query, limit, offset, collection)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
-    } else if results.is_empty() {
-        println!("no results");
+    if hybrid {
+        let mut qmd = Qmd::open(index)?;
+        let results = qmd.search_with_offset_in_collection(query, limit, offset, collection)?;
+        print_search_results(&results, json)
     } else {
-        for r in &results {
-            println!(
-                "{:.3}  #{} {} — {}",
-                r.score,
-                r.doc.docid(),
-                r.doc.display_path(),
-                r.doc.title,
-            );
-        }
+        let qmd = Qmd::open(index)?;
+        let results = qmd.search_fts_with_offset_in_collection(query, limit, offset, collection)?;
+        print_search_results(&results, json)
     }
-    Ok(())
 }
 
-fn cmd_fts(
+fn cmd_vsearch(
     index: &Path,
     query: &str,
     limit: usize,
@@ -405,14 +509,31 @@ fn cmd_fts(
     collection: Option<&str>,
     json: bool,
 ) -> qmd_rs::Result<()> {
-    let qmd = Qmd::open(index)?;
-    let results = qmd.search_fts_with_offset_in_collection(query, limit, offset, collection)?;
+    let mut qmd = Qmd::open(index)?;
+    let results = qmd.search_vec_with_offset_in_collection(query, limit, offset, collection)?;
+    print_search_results(&results, json)
+}
+
+fn cmd_query(
+    index: &Path,
+    query: &str,
+    limit: usize,
+    offset: usize,
+    collection: Option<&str>,
+    json: bool,
+) -> qmd_rs::Result<()> {
+    let mut qmd = Qmd::open(index)?;
+    let results = qmd.query_with_offset_in_collection(query, limit, offset, collection)?;
+    print_search_results(&results, json)
+}
+
+fn print_search_results(results: &[qmd_rs::SearchResult], json: bool) -> qmd_rs::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {
         println!("no results");
     } else {
-        for r in &results {
+        for r in results {
             println!(
                 "{:.3}  #{} {} — {}",
                 r.score,
@@ -425,15 +546,111 @@ fn cmd_fts(
     Ok(())
 }
 
-fn cmd_get(index: &Path, path: &str, json: bool) -> qmd_rs::Result<()> {
+fn cmd_ls(index: &Path, path: Option<&str>, json: bool) -> qmd_rs::Result<()> {
     let qmd = Qmd::open(index)?;
-    let doc = qmd.get(path)?;
+    if let Some(p) = path {
+        let (coll, subpath) = match p.split_once('/') {
+            Some((c, s)) => (c, Some(s)),
+            None => (p, None),
+        };
+        let docs = qmd.ls(Some(coll), subpath)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&docs)?);
+        } else if docs.is_empty() {
+            println!("no matching documents");
+        } else {
+            for d in docs {
+                println!("#{:<6} {} — {}", d.docid, d.path, d.title);
+            }
+        }
+    } else {
+        let colls = qmd.list_collections()?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&colls)?);
+        } else if colls.is_empty() {
+            println!("no collections registered");
+        } else {
+            for c in &colls {
+                println!(
+                    "{:<16} {:<40} {} docs",
+                    c.collection.name, c.collection.path, c.doc_count
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_get(
+    index: &Path,
+    path: &str,
+    from: Option<usize>,
+    lines: Option<usize>,
+    line_numbers: bool,
+    no_line_numbers: bool,
+    json: bool,
+) -> qmd_rs::Result<()> {
+    let qmd = Qmd::open(index)?;
+    let (target_path, parsed_from, parsed_lines) = parse_path_range(path);
+    let start_line = from.or(parsed_from);
+    let line_count = lines.or(parsed_lines);
+    let show_line_numbers = line_numbers && !no_line_numbers;
+
+    let mut doc = qmd.get(target_path)?;
+    if (start_line.is_some() || line_count.is_some() || show_line_numbers)
+        && let Some(body) = &doc.body
+    {
+        let (sliced, _, _, _) = slice_body(body, start_line, line_count, show_line_numbers);
+        doc.body = Some(sliced);
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&doc)?);
     } else {
         println!("# {}\n", doc.title);
         if let Some(body) = &doc.body {
             println!("{body}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_multi_get(
+    index: &Path,
+    pattern: &str,
+    lines: Option<usize>,
+    max_bytes: usize,
+    line_numbers: bool,
+    no_line_numbers: bool,
+    json: bool,
+) -> qmd_rs::Result<()> {
+    let qmd = Qmd::open(index)?;
+    let mut items = qmd.multi_get(pattern, max_bytes)?;
+    let show_line_numbers = line_numbers && !no_line_numbers;
+
+    if lines.is_some() || show_line_numbers {
+        for item in &mut items {
+            if let Some(body) = &item.body {
+                let (sliced, _, _, _) = slice_body(body, None, lines, show_line_numbers);
+                item.body = Some(sliced);
+            }
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else if items.is_empty() {
+        println!("no documents matched");
+    } else {
+        for item in items {
+            println!("=== {} (#{})\n", item.path, item.docid);
+            if item.skipped {
+                if let Some(reason) = &item.skip_reason {
+                    println!("[skipped: {reason}]\n");
+                }
+            } else if let Some(body) = &item.body {
+                println!("{body}\n");
+            }
         }
     }
     Ok(())
