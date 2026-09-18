@@ -56,6 +56,8 @@ cargo install qmd-rs-cli
 ```bash
 # Register a collection of markdown files
 qmd collection add ~/notes --name my-docs --pattern "**/*.md"
+# Alias: --mask is also supported
+qmd collection add ~/work/docs --name docs --mask "**/*.md"
 
 # List registered collections
 qmd collection list
@@ -70,20 +72,36 @@ qmd embed
 qmd embed --batch 500     # cap documents per run
 qmd embed --force         # clear existing embeddings and rebuild
 
-# BM25 full-text search
-qmd fts "query expansion" -n 5
+# Fast keyword search (BM25 full-text search)
+qmd search "query expansion" -n 5
+qmd search "authentication" --files            # output matching paths only
+qmd search "error handling" -a --min-score 0.3 # return all matches above threshold
 
-# Hybrid search (BM25 + vector + rerank)
-qmd search "local search engine for AI"
+# Semantic vector similarity search
+qmd vsearch "how to deploy locally" -n 5
 
-# Page through results, or emit JSON
-qmd search "indexing" --offset 10
-qmd fts "bm25" --json
-qmd search "indexing" --collection my-docs
+# Hybrid search (BM25 + vector + RRF + rerank)
+qmd query "quarterly planning process"
+qmd query "api reference" --no-rerank         # bypass cross-encoder reranking
+qmd query "auth tokens" --provider ollama     # LLM query expansion
+
+# Expand search queries into lexical, vector, and HyDE sub-queries
+qmd expand "authentication mechanisms"
+qmd expand "auth" --json
+
+# List collections and documents
+qmd ls
+qmd ls my-docs
+qmd ls my-docs/api
 
 # Get a document by collection/path or by #docid
 qmd get my-docs/meeting-notes.md
 qmd get "#a1b2c3"
+qmd get "my-docs/notes.md:10:30" --line-numbers  # slice lines 10-39 with line numbering
+
+# Batch retrieve documents by glob or comma-separated list
+qmd multi-get "my-docs/meeting*.md" -l 20        # retrieve first 20 lines of each match
+qmd multi-get "my-docs/a.md, my-docs/b.md" --max-bytes 20480
 
 # Show index status
 qmd status
@@ -111,6 +129,35 @@ work against a specific index file instead of the default location:
 ```bash
 qmd --index ~/indexes/docs.db status
 ```
+
+### Model Context Protocol (MCP) Server
+
+`qmd` includes a built-in JSON-RPC 2.0 stdio MCP server for agentic workflows (compatible with Claude Desktop, Claude Code, and other MCP clients):
+
+```bash
+qmd mcp
+```
+
+**Claude Desktop Configuration** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "qmd": {
+      "command": "qmd",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Tools Exposed:**
+- `query` — Hybrid search with sub-queries/pre-expansion, RRF fusion, and optional reranking
+- `get` — Retrieve document content or sliced lines by path, docid, or `:from:count`
+- `multi_get` — Batch retrieve documents by glob pattern or comma-separated list
+- `search` — Fast BM25 keyword search
+- `vsearch` — Semantic vector similarity search
+- `status` — Index health, document counts, and collection statistics
 
 ## Retrieval-quality regression gate
 
