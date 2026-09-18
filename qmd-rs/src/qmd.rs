@@ -548,10 +548,23 @@ impl Qmd {
         collection: Option<&str>,
         llm_config: Option<&crate::llm::LlmConfig>,
     ) -> Result<Vec<SearchResult>> {
-        let queries = crate::llm::parse_or_expand_query(query, llm_config);
-        self.search_with_queries_with_offset_in_collection(
-            query, &queries, limit, offset, collection,
+        self.query_with_options_with_offset_in_collection(
+            query, limit, offset, collection, llm_config, true,
         )
+    }
+
+    /// Hybrid search with explicit LLM configuration, optional reranking, and offset pagination.
+    pub fn query_with_options_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+        llm_config: Option<&crate::llm::LlmConfig>,
+        rerank: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let queries = crate::llm::parse_or_expand_query(query, llm_config);
+        self.search_with_queries_options(query, &queries, limit, offset, collection, rerank)
     }
 
     /// Hybrid search: FTS + vector + RRF fusion + optional reranking.
@@ -615,6 +628,19 @@ impl Qmd {
         limit: usize,
         offset: usize,
         collection: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_queries_options(query, queries, limit, offset, collection, true)
+    }
+
+    /// Search with pre-expanded queries, collection scope, and optional reranker pass.
+    pub fn search_with_queries_options(
+        &mut self,
+        query: &str,
+        queries: &[Query],
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+        rerank: bool,
     ) -> Result<Vec<SearchResult>> {
         let fingerprint = self.current_embedding_fingerprint();
         self.db.validate_embedding_fingerprint(&fingerprint)?;
@@ -683,7 +709,7 @@ impl Qmd {
             })
             .collect();
 
-        if results.len() > 1 {
+        if results.len() > 1 && rerank {
             self.apply_reranking(query, &mut results, requested);
         }
 
