@@ -71,6 +71,15 @@ enum Command {
         /// Run hybrid search instead of pure FTS.
         #[arg(long)]
         hybrid: bool,
+        /// Output matching file paths only.
+        #[arg(long)]
+        files: bool,
+        /// Return all matching results (no default limit).
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Minimum score threshold.
+        #[arg(long)]
+        min_score: Option<f64>,
     },
     /// Vector similarity search (semantic).
     #[command(alias = "vector-search", alias = "v-search")]
@@ -89,6 +98,15 @@ enum Command {
         /// Restrict results to this collection.
         #[arg(short = 'c', long)]
         collection: Option<String>,
+        /// Output matching file paths only.
+        #[arg(long)]
+        files: bool,
+        /// Return all matching results (no default limit).
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Minimum score threshold.
+        #[arg(long)]
+        min_score: Option<f64>,
     },
     /// Hybrid search (FTS + vector + RRF + rerank).
     #[command(alias = "deep-search")]
@@ -113,6 +131,18 @@ enum Command {
         /// LLM model name for query expansion.
         #[arg(long)]
         model: Option<String>,
+        /// Output matching file paths only.
+        #[arg(long)]
+        files: bool,
+        /// Return all matching results (no default limit).
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Minimum score threshold.
+        #[arg(long)]
+        min_score: Option<f64>,
+        /// Disable cross-encoder reranking.
+        #[arg(long)]
+        no_rerank: bool,
     },
     /// Expand a search query into lexical, vector, and HyDE variants.
     Expand {
@@ -210,7 +240,7 @@ enum CollectionAction {
         #[arg(long)]
         name: String,
         /// Glob pattern for files (default: **/*.md).
-        #[arg(long, default_value = "**/*.md")]
+        #[arg(long, alias = "mask", default_value = "**/*.md")]
         pattern: String,
     },
     /// List all collections.
@@ -299,14 +329,19 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
             offset,
             collection,
             hybrid,
+            files,
+            all,
+            min_score,
         } => cmd_search(
             index,
             &query,
-            limit,
+            if all { usize::MAX / 2 } else { limit },
             offset,
             collection.as_deref(),
             json,
             hybrid,
+            files,
+            min_score,
         ),
         Command::Vsearch {
             query,
@@ -314,7 +349,19 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
             json,
             offset,
             collection,
-        } => cmd_vsearch(index, &query, limit, offset, collection.as_deref(), json),
+            files,
+            all,
+            min_score,
+        } => cmd_vsearch(
+            index,
+            &query,
+            if all { usize::MAX / 2 } else { limit },
+            offset,
+            collection.as_deref(),
+            json,
+            files,
+            min_score,
+        ),
         Command::Query {
             query,
             limit,
@@ -323,15 +370,22 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
             collection,
             provider,
             model,
+            files,
+            all,
+            min_score,
+            no_rerank,
         } => cmd_query(
             index,
             &query,
-            limit,
+            if all { usize::MAX / 2 } else { limit },
             offset,
             collection.as_deref(),
             provider.as_deref(),
             model.as_deref(),
             json,
+            files,
+            min_score,
+            no_rerank,
         ),
         Command::Expand {
             query,
@@ -521,6 +575,7 @@ fn embed_report(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     index: &Path,
     query: &str,
@@ -529,18 +584,21 @@ fn cmd_search(
     collection: Option<&str>,
     json: bool,
     hybrid: bool,
+    files: bool,
+    min_score: Option<f64>,
 ) -> qmd_rs::Result<()> {
     if hybrid {
         let mut qmd = Qmd::open(index)?;
         let results = qmd.search_with_offset_in_collection(query, limit, offset, collection)?;
-        print_search_results(&results, json)
+        print_search_results(&results, json, files, min_score)
     } else {
         let qmd = Qmd::open(index)?;
         let results = qmd.search_fts_with_offset_in_collection(query, limit, offset, collection)?;
-        print_search_results(&results, json)
+        print_search_results(&results, json, files, min_score)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_vsearch(
     index: &Path,
     query: &str,
@@ -548,10 +606,12 @@ fn cmd_vsearch(
     offset: usize,
     collection: Option<&str>,
     json: bool,
+    files: bool,
+    min_score: Option<f64>,
 ) -> qmd_rs::Result<()> {
     let mut qmd = Qmd::open(index)?;
     let results = qmd.search_vec_with_offset_in_collection(query, limit, offset, collection)?;
-    print_search_results(&results, json)
+    print_search_results(&results, json, files, min_score)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -564,6 +624,9 @@ fn cmd_query(
     provider: Option<&str>,
     model: Option<&str>,
     json: bool,
+    files: bool,
+    min_score: Option<f64>,
+    no_rerank: bool,
 ) -> qmd_rs::Result<()> {
     let mut config = LlmConfig::from_env();
     if let Some(p) = provider {
@@ -573,14 +636,15 @@ fn cmd_query(
         config.model = m.to_string();
     }
     let mut qmd = Qmd::open(index)?;
-    let results = qmd.query_with_config_with_offset_in_collection(
+    let results = qmd.query_with_options_with_offset_in_collection(
         query,
         limit,
         offset,
         collection,
         Some(&config),
+        !no_rerank,
     )?;
-    print_search_results(&results, json)
+    print_search_results(&results, json, files, min_score)
 }
 
 fn cmd_expand(
@@ -613,13 +677,41 @@ fn cmd_expand(
     Ok(())
 }
 
-fn print_search_results(results: &[qmd_rs::SearchResult], json: bool) -> qmd_rs::Result<()> {
+fn print_search_results(
+    results: &[qmd_rs::SearchResult],
+    json: bool,
+    files: bool,
+    min_score: Option<f64>,
+) -> qmd_rs::Result<()> {
+    let filtered: Vec<&qmd_rs::SearchResult> = results
+        .iter()
+        .filter(|r| min_score.is_none_or(|min| r.score >= min))
+        .collect();
+
+    if files {
+        let mut seen = std::collections::HashSet::new();
+        let paths: Vec<String> = filtered
+            .iter()
+            .map(|r| r.doc.display_path())
+            .filter(|p| seen.insert(p.clone()))
+            .collect();
+
+        if json {
+            println!("{}", serde_json::to_string_pretty(&paths)?);
+        } else {
+            for path in paths {
+                println!("{path}");
+            }
+        }
+        return Ok(());
+    }
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
-    } else if results.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
+    } else if filtered.is_empty() {
         println!("no results");
     } else {
-        for r in results {
+        for r in filtered {
             println!(
                 "{:.3}  #{} {} — {}",
                 r.score,
@@ -952,5 +1044,57 @@ mod tests {
                 .is_none()
         );
         fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn cli_parser_accepts_phase3_flags() {
+        let parsed = Cli::try_parse_from([
+            "qmd", "search", "query", "--files", "-a", "--min-score", "0.5",
+        ])
+        .expect("search flags");
+        if let Command::Search {
+            files,
+            all,
+            min_score,
+            ..
+        } = parsed.command
+        {
+            assert!(files);
+            assert!(all);
+            assert_eq!(min_score, Some(0.5));
+        } else {
+            panic!("expected Command::Search");
+        }
+
+        let parsed_query = Cli::try_parse_from([
+            "qmd", "query", "query", "--files", "--no-rerank", "--min-score", "0.8",
+        ])
+        .expect("query flags");
+        if let Command::Query {
+            files,
+            no_rerank,
+            min_score,
+            ..
+        } = parsed_query.command
+        {
+            assert!(files);
+            assert!(no_rerank);
+            assert_eq!(min_score, Some(0.8));
+        } else {
+            panic!("expected Command::Query");
+        }
+
+        let parsed_coll = Cli::try_parse_from([
+            "qmd", "collection", "add", ".", "--name", "test", "--mask", "*.markdown",
+        ])
+        .expect("collection add mask alias");
+        if let Command::Collection {
+            action: CollectionAction::Add { pattern, .. },
+        } = parsed_coll.command
+        {
+            assert_eq!(pattern, "*.markdown");
+        } else {
+            panic!("expected CollectionAction::Add");
+        }
     }
 }

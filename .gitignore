@@ -27,6 +27,7 @@ target
 
 # hermes scratch + plan files (per-machine, not source)
 .hermes/
+.agent/
 
 # linked worktree roots (managed by `git worktree`, never committed)
 .worktrees/
