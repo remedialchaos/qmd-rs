@@ -215,6 +215,20 @@ impl Document {
     }
 }
 
+/// Summary of an indexed active document.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct DocumentSummary {
+    /// Document ID (first 6 chars of hash).
+    pub docid: String,
+    /// Collection name.
+    pub collection: String,
+    /// Collection-relative path.
+    pub path: String,
+    /// Document title.
+    pub title: String,
+}
+
 /// Search result with relevance score.
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
@@ -1084,11 +1098,12 @@ impl Db {
         Ok(Vec::new())
     }
 
-    /// Vector search after validating the embedding contract.
-    pub fn search_vec_with_fingerprint(
+    /// Vector search with offset pagination after validating the embedding contract.
+    pub fn search_vec_with_offset_and_fingerprint(
         &self,
         query_embedding: &[f32],
         limit: usize,
+        offset: usize,
         collection: Option<&str>,
         expected_fingerprint: &str,
     ) -> Result<Vec<SearchResult>> {
@@ -1119,12 +1134,6 @@ impl Db {
             if self.vector_count()? == 0 {
                 return Ok(Vec::new());
             }
-            // Rank only active documents in the selected collection, one row
-            // per (collection, path) keeping each document's best chunk by
-            // distance, so duplicates cannot crowd out distinct documents
-            // before the requested limit. Native KNN caps k at 4096 and
-            // truncates ties before our document ordering; scalar L2 matches
-            // vec0's default metric without either limitation.
             let scoped_sql = r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
                      LENGTH(c.doc), MIN(vec_distance_L2(ve.embedding, ?1)) AS distance
               FROM documents d
@@ -1134,22 +1143,18 @@ impl Db {
               WHERE d.active = 1 AND d.collection = ?3
               GROUP BY d.collection, d.path
               ORDER BY distance, d.collection, d.path, d.hash
-              LIMIT ?2";
+              LIMIT ?2 OFFSET ?4";
             let mut stmt = self.conn.prepare(scoped_sql)?;
             let mut results: Vec<SearchResult> = stmt
-                .query_map(params![vec_bytes, limit as i64, coll], map_row)?
+                .query_map(
+                    params![vec_bytes, limit as i64, coll, offset as i64],
+                    map_row,
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             results.truncate(limit);
             return Ok(results);
         }
 
-        // Unscoped search uses the same exact active-document scalar L2
-        // aggregation. Native KNN is not usable here: it caps k at 4096 and
-        // truncates ties before active filtering or document aggregation, so
-        // inactive or duplicate chunk rows can crowd distinct active
-        // documents out of any fixed window. Exact aggregation over active
-        // documents satisfies the contract without an oversampling constant
-        // or best-effort cap. Performance optimization is deferred.
         if self.vector_count()? == 0 {
             return Ok(Vec::new());
         }
@@ -1162,13 +1167,122 @@ impl Db {
               WHERE d.active = 1
               GROUP BY d.collection, d.path
               ORDER BY distance, d.collection, d.path, d.hash
-              LIMIT ?2";
+              LIMIT ?2 OFFSET ?3";
         let mut stmt = self.conn.prepare(unscoped_sql)?;
         let results: Vec<SearchResult> = stmt
-            .query_map(params![vec_bytes, limit as i64], map_row)?
+            .query_map(params![vec_bytes, limit as i64, offset as i64], map_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(results)
+    }
+
+    /// Vector search after validating the embedding contract.
+    pub fn search_vec_with_fingerprint(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        collection: Option<&str>,
+        expected_fingerprint: &str,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_vec_with_offset_and_fingerprint(
+            query_embedding,
+            limit,
+            0,
+            collection,
+            expected_fingerprint,
+        )
+    }
+
+    /// List active documents, optionally filtered by collection and path prefix.
+    pub fn list_active_documents(
+        &self,
+        collection: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>> {
+        let prefix = path_prefix.unwrap_or("").trim_start_matches('/');
+        let mut results = Vec::new();
+
+        if let Some(coll) = collection {
+            let sql = r"SELECT d.collection, d.path, d.title, d.hash
+                        FROM documents d
+                        WHERE d.active = 1 AND d.collection = ?1
+                        ORDER BY d.path";
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(params![coll], |row| {
+                let col: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let hash: String = row.get(3)?;
+                let docid = hash[..6.min(hash.len())].to_string();
+                Ok(DocumentSummary {
+                    docid,
+                    collection: col,
+                    path,
+                    title,
+                })
+            })?;
+            for row in rows {
+                let doc = row?;
+                if prefix.is_empty() || doc.path.starts_with(prefix) {
+                    results.push(doc);
+                }
+            }
+        } else {
+            let sql = r"SELECT d.collection, d.path, d.title, d.hash
+                        FROM documents d
+                        WHERE d.active = 1
+                        ORDER BY d.collection, d.path";
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([], |row| {
+                let col: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let hash: String = row.get(3)?;
+                let docid = hash[..6.min(hash.len())].to_string();
+                Ok(DocumentSummary {
+                    docid,
+                    collection: col,
+                    path,
+                    title,
+                })
+            })?;
+            for row in rows {
+                let doc = row?;
+                if prefix.is_empty()
+                    || doc.path.starts_with(prefix)
+                    || format!("{}/{}", doc.collection, doc.path).starts_with(prefix)
+                {
+                    results.push(doc);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Return all active documents with full content body.
+    pub fn get_all_active_documents(&self) -> Result<Vec<Document>> {
+        let sql = r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at, c.doc, LENGTH(c.doc)
+                    FROM documents d
+                    JOIN content c ON c.hash = d.hash
+                    WHERE d.active = 1
+                    ORDER BY d.collection, d.path";
+        let mut stmt = self.conn.prepare(sql)?;
+        let docs = stmt
+            .query_map([], |row| {
+                let body: String = row.get(5)?;
+                let body_len: i64 = row.get(6)?;
+                Ok(Document {
+                    collection: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    hash: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    body_len: body_len as usize,
+                    body: Some(body),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(docs)
     }
 
     // ── Index health ────────────────────────────────────────────────────
