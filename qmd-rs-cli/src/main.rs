@@ -11,6 +11,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod mcp;
+
 use clap::{Parser, Subcommand};
 use qmd_rs::{
     Collection, DoctorCheckStatus, LlmConfig, LlmProvider, Qmd, parse_or_expand_query,
@@ -228,6 +230,8 @@ enum Command {
     Cleanup,
     /// Vacuum the database to reclaim space.
     Vacuum,
+    /// Start the Model Context Protocol (MCP) server over stdio.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -431,6 +435,7 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
         Command::Context { action } => cmd_context(index, action),
         Command::Cleanup => cmd_cleanup(index),
         Command::Vacuum => cmd_vacuum(index),
+        Command::Mcp => mcp::run_mcp(index),
     }
 }
 
@@ -955,7 +960,7 @@ fn cmd_vacuum(index: &Path) -> qmd_rs::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
@@ -1049,7 +1054,13 @@ mod tests {
     #[test]
     fn cli_parser_accepts_phase3_flags() {
         let parsed = Cli::try_parse_from([
-            "qmd", "search", "query", "--files", "-a", "--min-score", "0.5",
+            "qmd",
+            "search",
+            "query",
+            "--files",
+            "-a",
+            "--min-score",
+            "0.5",
         ])
         .expect("search flags");
         if let Command::Search {
@@ -1067,7 +1078,13 @@ mod tests {
         }
 
         let parsed_query = Cli::try_parse_from([
-            "qmd", "query", "query", "--files", "--no-rerank", "--min-score", "0.8",
+            "qmd",
+            "query",
+            "query",
+            "--files",
+            "--no-rerank",
+            "--min-score",
+            "0.8",
         ])
         .expect("query flags");
         if let Command::Query {
@@ -1085,7 +1102,14 @@ mod tests {
         }
 
         let parsed_coll = Cli::try_parse_from([
-            "qmd", "collection", "add", ".", "--name", "test", "--mask", "*.markdown",
+            "qmd",
+            "collection",
+            "add",
+            ".",
+            "--name",
+            "test",
+            "--mask",
+            "*.markdown",
         ])
         .expect("collection add mask alias");
         if let Command::Collection {
@@ -1096,5 +1120,8 @@ mod tests {
         } else {
             panic!("expected CollectionAction::Add");
         }
+
+        let parsed_mcp = Cli::try_parse_from(["qmd", "mcp"]).expect("mcp parser");
+        assert!(matches!(parsed_mcp.command, Command::Mcp));
     }
 }
