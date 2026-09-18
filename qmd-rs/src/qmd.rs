@@ -508,20 +508,20 @@ impl Qmd {
 
     /// Hybrid search: FTS + vector + RRF + reranking (alias for `search`).
     pub fn query(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        self.search(query, limit)
+        self.query_with_offset(query, limit, 0)
     }
 
-    /// Hybrid search with offset pagination (alias for `search_with_offset`).
+    /// Hybrid search with offset pagination.
     pub fn query_with_offset(
         &mut self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.search_with_offset(query, limit, offset)
+        self.query_with_offset_in_collection(query, limit, offset, None)
     }
 
-    /// Hybrid search with offset pagination in collection (alias for `search_with_offset_in_collection`).
+    /// Hybrid search with offset pagination in collection.
     pub fn query_with_offset_in_collection(
         &mut self,
         query: &str,
@@ -529,7 +529,29 @@ impl Qmd {
         offset: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        self.search_with_offset_in_collection(query, limit, offset, collection)
+        let config = crate::llm::LlmConfig::from_env();
+        self.query_with_config_with_offset_in_collection(
+            query,
+            limit,
+            offset,
+            collection,
+            Some(&config),
+        )
+    }
+
+    /// Hybrid search with explicit LLM configuration and offset pagination.
+    pub fn query_with_config_with_offset_in_collection(
+        &mut self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        collection: Option<&str>,
+        llm_config: Option<&crate::llm::LlmConfig>,
+    ) -> Result<Vec<SearchResult>> {
+        let queries = crate::llm::parse_or_expand_query(query, llm_config);
+        self.search_with_queries_with_offset_in_collection(
+            query, &queries, limit, offset, collection,
+        )
     }
 
     /// Hybrid search: FTS + vector + RRF fusion + optional reranking.

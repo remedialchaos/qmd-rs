@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use qmd_rs::{Collection, DoctorCheckStatus, Qmd, parse_path_range, slice_body};
+use qmd_rs::{
+    Collection, DoctorCheckStatus, LlmConfig, LlmProvider, Qmd, parse_or_expand_query,
+    parse_path_range, slice_body,
+};
 
 /// QMD — local search engine for markdown files.
 #[derive(Parser)]
@@ -104,6 +107,26 @@ enum Command {
         /// Restrict results to this collection.
         #[arg(short = 'c', long)]
         collection: Option<String>,
+        /// LLM provider for query expansion (ollama, openai, anthropic, none).
+        #[arg(long)]
+        provider: Option<String>,
+        /// LLM model name for query expansion.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Expand a search query into lexical, vector, and HyDE variants.
+    Expand {
+        /// Search query or query document to expand.
+        query: String,
+        /// LLM provider (ollama, openai, anthropic, none).
+        #[arg(long)]
+        provider: Option<String>,
+        /// LLM model name.
+        #[arg(long)]
+        model: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List indexed documents in a collection or show collections overview.
     Ls {
@@ -298,7 +321,24 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
             json,
             offset,
             collection,
-        } => cmd_query(index, &query, limit, offset, collection.as_deref(), json),
+            provider,
+            model,
+        } => cmd_query(
+            index,
+            &query,
+            limit,
+            offset,
+            collection.as_deref(),
+            provider.as_deref(),
+            model.as_deref(),
+            json,
+        ),
+        Command::Expand {
+            query,
+            provider,
+            model,
+            json,
+        } => cmd_expand(&query, provider.as_deref(), model.as_deref(), json),
         Command::Ls { path, json } => cmd_ls(index, path.as_deref(), json),
         Command::Get {
             path,
@@ -514,17 +554,63 @@ fn cmd_vsearch(
     print_search_results(&results, json)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     index: &Path,
     query: &str,
     limit: usize,
     offset: usize,
     collection: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
     json: bool,
 ) -> qmd_rs::Result<()> {
+    let mut config = LlmConfig::from_env();
+    if let Some(p) = provider {
+        config.provider = p.parse().unwrap_or(LlmProvider::None);
+    }
+    if let Some(m) = model {
+        config.model = m.to_string();
+    }
     let mut qmd = Qmd::open(index)?;
-    let results = qmd.query_with_offset_in_collection(query, limit, offset, collection)?;
+    let results = qmd.query_with_config_with_offset_in_collection(
+        query,
+        limit,
+        offset,
+        collection,
+        Some(&config),
+    )?;
     print_search_results(&results, json)
+}
+
+fn cmd_expand(
+    query: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    json: bool,
+) -> qmd_rs::Result<()> {
+    let mut config = LlmConfig::from_env();
+    if let Some(p) = provider {
+        config.provider = p.parse().unwrap_or(LlmProvider::None);
+    }
+    if let Some(m) = model {
+        config.model = m.to_string();
+    }
+    let queries = parse_or_expand_query(query, Some(&config));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&queries)?);
+    } else {
+        for q in &queries {
+            let kind_str = match q.kind {
+                qmd_rs::QueryType::Lex => "lex",
+                qmd_rs::QueryType::Vec => "vec",
+                qmd_rs::QueryType::Hyde => "hyde",
+                _ => "query",
+            };
+            println!("{kind_str}: {}", q.text);
+        }
+    }
+    Ok(())
 }
 
 fn print_search_results(results: &[qmd_rs::SearchResult], json: bool) -> qmd_rs::Result<()> {
