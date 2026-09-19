@@ -20,8 +20,8 @@ in indexed local files.
 
 The workflow is always:
 
-1. Search for candidate documents using `qmd fts` (keyword) or `qmd search` (hybrid).
-2. Retrieve the full source with `qmd get`.
+1. Search for candidate documents using `qmd search` (BM25 keyword), `qmd vsearch` (vector semantic), or `qmd query` (hybrid reranked).
+2. Retrieve the source with `qmd get` (or line slicing `qmd get <path>:<from>:<lines>`).
 3. Answer from retrieved text, citing paths or docids.
 
 Do not answer from snippets alone when the user needs facts, decisions, quotes,
@@ -31,14 +31,15 @@ Typical loop:
 
 ```bash
 # 1. Search for candidates
-qmd fts "merchant reality support interviews" -n 5
-# or hybrid search:
 qmd search "merchant reality support interviews" -n 5
+# or hybrid search with cross-encoder reranking:
+qmd query "merchant reality support interviews" -n 5
 
 # leads: #abc123 wiki/concepts/customer-proximity.md; #def432 wiki/sources/merchant-call.md
 
-# 2. Retrieve full document source
+# 2. Retrieve full document source or sliced window
 qmd get "#abc123"
+qmd get "wiki/concepts/customer-proximity.md:1:30" --line-numbers
 ```
 
 When reporting what you retrieved, a compact note is enough; do not paste whole
@@ -52,59 +53,76 @@ Retrieved:
 
 ## Pick the right search mode
 
-### 1. BM25 Lexical Keyword Search (`qmd fts`)
-Use **BM25 lexical search** when you know exact words, titles, names, code
+### 1. BM25 Lexical Keyword Search (`qmd search`)
+Use **BM25 lexical search** (`qmd search`, alias `qmd fts`) when you know exact words, titles, names, code
 symbols, error strings, or rare phrases. It is instant and requires no model or vector state:
 
 ```bash
-qmd fts "cockpit OKR Goodhart" -n 10
-qmd fts '"AI Before Headcount"' -c wiki -n 5
-qmd fts "struct ConversationMetrics" --json
+qmd search "cockpit OKR Goodhart" -n 10
+qmd search '"AI Before Headcount"' -c wiki -n 5
+qmd search "struct ConversationMetrics" --json
+qmd search "auth token" --files
 ```
 
-### 2. Hybrid Semantic Search (`qmd search`)
-Use **hybrid search** when the user describes an idea indirectly, uses different
-wording than the source, or needs conceptual recall. It combines BM25 full-text matching,
-vector semantic similarity, Reciprocal Rank Fusion (RRF), and local reranking:
+### 2. Semantic Vector Search (`qmd vsearch`)
+Use **vector search** (`qmd vsearch`, alias `vector-search`) for pure semantic similarity when looking for
+conceptually related notes without requiring exact keyword overlap:
 
 ```bash
-qmd search "metrics as instruments without letting OKRs replace judgment" -n 5
-qmd search "customer proximity through support and interviews" -c wiki -n 5
-qmd search "how does prompt cache ratio get computed" --json
+qmd vsearch "how we think about user research" -n 5
+qmd vsearch "protecting client from excessive background polling" -c wiki -n 5
 ```
 
-If vector search is unavailable or reports legacy fingerprints, use `qmd fts` with
-targeted keywords.
-
-### 3. Structured JSON for Agent Steps
-Both `fts` and `search` support `--json` for structured parsing:
+### 3. Hybrid Semantic Search & Reranking (`qmd query`)
+Use **hybrid search** (`qmd query`, alias `deep-search`) for complex questions. It expands the query,
+merges BM25 lexical and vector candidates via Reciprocal Rank Fusion (RRF), and applies cross-encoder reranking:
 
 ```bash
-qmd fts "matrix bridge" --json
-qmd search "context compactor" --json -n 5
+qmd query "metrics as instruments without letting OKRs replace judgment" -n 5
+qmd query "customer proximity through support and interviews" -c wiki -n 5
+qmd query "prompt cache ratio calculation" --min-score 0.5
+qmd query "quick search without cross-encoder" --no-rerank
 ```
 
-JSON output includes `docid`, `collection`, `path`, `title`, and `score`.
+### 4. Structured Output & Flags
+All search commands support:
+- `--json`: Machine-readable output with `docid`, `collection`, `path`, `title`, and `score`.
+- `--files`: Output matching file paths only (one per line, or JSON array with `--json`).
+- `-a` / `--all`: Return all matching results without default limit capping.
+- `--min-score <SCORE>`: Filter out lower-relevance results below score threshold.
 
-## Retrieve sources (`qmd get`)
+## Retrieve sources (`qmd get` & `qmd multi-get`)
 
 Search results include docids like `#abc123` and collection paths like `wiki/notes.md`. Fetch them:
 
 ```bash
+# Full document
 qmd get "#abc123"
 qmd get "wiki/concepts/customer-proximity.md"
-qmd get "#abc123" --json
+
+# Line slicing (start line 1, 30 lines) with line numbers
+qmd get "wiki/concepts/customer-proximity.md:1:30" --line-numbers
+qmd get "wiki/concepts/customer-proximity.md" --from 20 -l 15
+
+# Batch retrieval with glob pattern or comma-separated list
+qmd multi-get "wiki/concepts/customer*.md" -l 20
+qmd multi-get "#abc123,#def432" --json
 ```
 
-`qmd get` outputs the full document content. When citing sources in your response:
+When citing sources in your response:
 - Cite the collection path and `#docid` (e.g. `wiki/concepts/customer-proximity.md (#abc123)`).
 - Provide verbatim excerpts relevant to the user's question.
 
 ## Discover what is indexed
 
-Inspect registered collections and index status before searching unfamiliar environments:
+Inspect registered collections, document listings, and index status:
 
 ```bash
+# List collections or documents inside a collection subpath
+qmd ls
+qmd ls wiki
+qmd ls wiki/concepts
+
 qmd collection list
 qmd status
 qmd doctor
@@ -113,8 +131,8 @@ qmd doctor
 Add collection filters with `-c` or `--collection` when broad searches drift into the wrong corpus:
 
 ```bash
-qmd fts "headcount autonomous agents" -c wiki -n 10
-qmd search "service cutover procedure" --collection wiki -n 5
+qmd search "headcount autonomous agents" -c wiki -n 10
+qmd query "service cutover procedure" --collection wiki -n 5
 ```
 
 Omit `-c` to search across all registered collections.
@@ -123,21 +141,21 @@ Omit `-c` to search across all registered collections.
 
 Good QMD searches combine:
 
-1. **Title and alias anchors:** exact page titles, named entities, identifiers (`qmd fts`).
-2. **Semantic paraphrase:** how a human or documentation author describes the concept (`qmd search`).
+1. **Title and alias anchors:** exact page titles, named entities, identifiers (`qmd search`).
+2. **Semantic paraphrase:** how a human or documentation author describes the concept (`qmd query`).
 3. **Collection targeting:** scoping to the right collection with `-c <collection>`.
 
 Examples:
 
 ```bash
 # Exact title lookup
-qmd fts '"arm the rebels" merchants tools' -c wiki
+qmd search '"arm the rebels" merchants tools' -c wiki
 
 # Semantic concept lookup
-qmd search "founder stays close to user reality through support channels" -c wiki
+qmd query "founder stays close to user reality through support channels" -c wiki
 
 # Source / transcript lookup
-qmd fts "WhatsApp cadence Shawn Ryan" -c wiki -n 10
+qmd search "WhatsApp cadence Shawn Ryan" -c wiki -n 10
 ```
 
 ## Setup and maintenance
@@ -182,8 +200,9 @@ status, followed by `qmd cleanup` and `qmd embed --force`.
 
 - **Do not stop at snippets.** Fetch documents with `qmd get` before making factual claims or decisions.
 - **Choose the right command:**
-    - Use `qmd fts` for exact technical terms, error logs, code symbols, and specific phrases.
-    - Use `qmd search` for natural language questions and conceptual exploration.
+    - Use `qmd search` for exact technical terms, error logs, code symbols, and specific phrases (BM25 keyword).
+    - Use `qmd vsearch` for conceptual similarity without requiring keyword matches (dense vector).
+    - Use `qmd query` for complex questions requiring query expansion and cross-encoder reranking.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, `qmd embed`, and `qmd cleanup` change local state and can be CPU/GPU intensive.
 - **Collection names matter.** Specify `-c <name>` to isolate search when multiple collections exist.
 - **Inspect diagnostics when needed.** If vector search warns of fingerprint mismatches, verify with `qmd doctor` before running `qmd embed --force`.
