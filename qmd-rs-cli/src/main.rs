@@ -24,7 +24,7 @@ use qmd_rs::{
 #[command(name = "qmd", version, about)]
 struct Cli {
     /// Path to the SQLite index file.
-    #[arg(long)]
+    #[arg(long, env = "QMD_INDEX")]
     index: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -1027,6 +1027,29 @@ mod tests {
     fn explicit_index_is_preserved() {
         let explicit = PathBuf::from("relative/custom.sqlite");
         assert_eq!(resolve_index_path(Some(&explicit)), explicit);
+    }
+
+    #[test]
+    #[allow(unsafe_code, clippy::disallowed_methods)]
+    fn env_index_is_parsed_when_set() {
+        let key = "QMD_INDEX";
+        let expected = "/custom/env/index.sqlite";
+        // SAFETY: Test sets and cleans up test environment variable.
+        unsafe {
+            std::env::set_var(key, expected);
+        }
+        let parsed = Cli::try_parse_from(["qmd", "status"]).expect("parse with env");
+        assert_eq!(parsed.index, Some(PathBuf::from(expected)));
+
+        let override_path = "/override/index.sqlite";
+        let parsed_override = Cli::try_parse_from(["qmd", "--index", override_path, "status"])
+            .expect("parse with override");
+        assert_eq!(parsed_override.index, Some(PathBuf::from(override_path)));
+
+        // SAFETY: Cleaning up test environment variable.
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

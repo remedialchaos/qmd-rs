@@ -124,11 +124,15 @@ qmd cleanup
 qmd vacuum
 ```
 
-All commands operate on a single SQLite index database. Use `--index <PATH>` to
-work against a specific index file instead of the default location:
+All commands operate on a SQLite index database (default: `$XDG_DATA_HOME/qmd/index.sqlite` or `~/.local/share/qmd/index.sqlite`). Use `--index <PATH>` or the `QMD_INDEX` environment variable to work against a specific index file (for example, for isolated agent or project indexes):
 
 ```bash
-qmd --index ~/indexes/docs.db status
+# Via command-line argument
+qmd --index ~/indexes/docs.sqlite status
+
+# Or via environment variable (ideal for per-agent or per-workspace routing)
+export QMD_INDEX=~/.gemini/antigravity-cli/qmd.sqlite
+qmd status
 ```
 
 ### Model Context Protocol (MCP) Server

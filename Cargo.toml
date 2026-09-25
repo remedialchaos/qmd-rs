@@ -12,7 +12,7 @@ repository = "https://github.com/remedialchaos/qmd-rs"
 [workspace.dependencies]
 qmd-rs = { version = "0.5", path = "qmd-rs" }
 
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 # Keep TLS in the Rust dependency graph rather than linking to system OpenSSL.
 fastembed = { version = "5.13", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
 globset = "0.4"

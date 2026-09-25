@@ -206,4 +206,5 @@ status, followed by `qmd cleanup` and `qmd embed --force`.
     - Use `qmd query` for complex questions requiring query expansion and cross-encoder reranking.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, `qmd embed`, and `qmd cleanup` change local state and can be CPU/GPU intensive.
 - **Collection names matter.** Specify `-c <name>` to isolate search when multiple collections exist.
+- **Scoped databases:** Set `QMD_INDEX=/path/to/index.sqlite` (or pass `--index <path>`) to target a private or project-specific index rather than the host shared index.
 - **Inspect diagnostics when needed.** If vector search warns of fingerprint mismatches, verify with `qmd doctor` before running `qmd embed --force`.
