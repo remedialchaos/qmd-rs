@@ -173,6 +173,7 @@ qmd update -c my-notes
 
 # Generate vector embeddings
 qmd embed
+qmd embed -c my-notes     # scope embedding generation to specific collection
 qmd embed --batch 500     # cap documents per run
 qmd embed --force         # clear existing embeddings and rebuild
 

@@ -52,6 +52,9 @@ enum Command {
         /// Maximum number of documents to embed.
         #[arg(long)]
         batch: Option<usize>,
+        /// Restrict embedding to this collection.
+        #[arg(short = 'c', long)]
+        collection: Option<String>,
     },
     /// Full-text keyword search (BM25 only).
     #[command(alias = "fts")]
@@ -325,7 +328,11 @@ fn run(index: &Path, command: Command) -> qmd_rs::Result<()> {
     match command {
         Command::Collection { action } => cmd_collection(index, action),
         Command::Update { collection } => cmd_update(index, &collection),
-        Command::Embed { force, batch } => cmd_embed(index, force, batch),
+        Command::Embed {
+            force,
+            batch,
+            collection,
+        } => cmd_embed(index, force, batch, collection.as_deref()),
         Command::Search {
             query,
             limit,
@@ -546,13 +553,18 @@ fn cmd_update(index: &Path, collections: &[String]) -> qmd_rs::Result<()> {
     Ok(())
 }
 
-fn cmd_embed(index: &Path, force: bool, batch: Option<usize>) -> qmd_rs::Result<()> {
+fn cmd_embed(
+    index: &Path,
+    force: bool,
+    batch: Option<usize>,
+    collection: Option<&str>,
+) -> qmd_rs::Result<()> {
     let mut qmd = Qmd::open(index)?;
     if force {
         qmd.clear_embeddings()?;
         println!("cleared all embeddings");
     }
-    let r = qmd.embed_with_batch(batch)?;
+    let r = qmd.embed_with_batch_in_collection(batch, collection)?;
     for message in &r.failure_messages {
         eprintln!("{message}");
     }
@@ -1123,5 +1135,21 @@ mod tests {
 
         let parsed_mcp = Cli::try_parse_from(["qmd", "mcp"]).expect("mcp parser");
         assert!(matches!(parsed_mcp.command, Command::Mcp));
+
+        let parsed_embed =
+            Cli::try_parse_from(["qmd", "embed", "-c", "wiki", "--batch", "50", "--force"])
+                .expect("embed parser");
+        if let Command::Embed {
+            force,
+            batch,
+            collection,
+        } = parsed_embed.command
+        {
+            assert!(force);
+            assert_eq!(batch, Some(50));
+            assert_eq!(collection, Some("wiki".to_string()));
+        } else {
+            panic!("expected Command::Embed");
+        }
     }
 }

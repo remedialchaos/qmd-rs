@@ -69,8 +69,9 @@ qmd update -c my-docs
 # Generate vector embeddings for unembedded documents
 # (the first run downloads the default embedding model)
 qmd embed
-qmd embed --batch 500     # cap documents per run
-qmd embed --force         # clear existing embeddings and rebuild
+qmd embed -c notes         # scope embedding generation to a collection
+qmd embed --batch 500      # cap documents per run
+qmd embed --force          # clear existing embeddings and rebuild
 
 # Fast keyword search (BM25 full-text search)
 qmd search "query expansion" -n 5
@@ -177,7 +178,7 @@ Recent releases include safeguards that keep indexing and retrieval predictable:
 - Full-text queries preserve the tokenizer's punctuation boundaries, so identifiers and paths keep their searchable terms; punctuation-only queries produce no direct FTS hits.
 - During `qmd update`, a tracked Markdown file that becomes empty or whitespace-only is deactivated rather than left searchable as stale content.
 - Vector candidate selection returns each active document at most once, even when a document has multiple matching chunks, and reciprocal-rank fusion suppresses duplicate votes within each ranked list.
-- Embedding work runs in bounded groups and supports a per-run `--batch` cap. Completed groups are published independently, while embedding failures are reported by the CLI and make the command fail instead of being treated as success.
+- Embedding work runs in bounded groups and supports collection scoping (`-c`/`--collection`) and a per-run `--batch` cap. Completed groups are published independently, while embedding failures are reported by the CLI and make the command fail instead of being treated as success.
 
 ## License
 

@@ -357,18 +357,29 @@ impl Qmd {
     /// unique content hashes; each group is generated outside any write
     /// transaction and published only for the documents that completed.
     pub fn embed(&mut self) -> Result<EmbedResult> {
-        self.embed_with_batch(None)
+        self.embed_with_batch_in_collection(None, None)
     }
 
-    /// Generate embeddings for unembedded documents.
+    /// Generate embeddings for unembedded documents, optionally scoped to a collection.
     ///
-    /// A default run streams the whole unembedded corpus through bounded groups
+    /// A default run streams the unembedded corpus through bounded groups
     /// of [`DEFAULT_EMBED_GROUP_SIZE`] unique content hashes. `batch` caps the
     /// total number of documents embedded by this invocation while groups stay
-    /// bounded. Each group is fetched, generated, and published independently,
+    /// bounded. `collection` restricts embedding work to documents within that
+    /// collection. Each group is fetched, generated, and published independently,
     /// so completed work survives an unrelated failure and no whole-corpus or
     /// whole-vector collection is retained in memory.
-    pub fn embed_with_batch(&mut self, batch: Option<usize>) -> Result<EmbedResult> {
+    pub fn embed_with_batch_in_collection(
+        &mut self,
+        batch: Option<usize>,
+        collection: Option<&str>,
+    ) -> Result<EmbedResult> {
+        if let Some(col) = collection
+            && self.db.get_collection(col)?.is_none()
+        {
+            return Err(Error::Config(format!("collection '{col}' not found")));
+        }
+
         let fingerprint = self.current_embedding_fingerprint();
         self.db.validate_embedding_fingerprint(&fingerprint)?;
 
@@ -387,7 +398,9 @@ impl Qmd {
             if request == 0 {
                 break;
             }
-            let group = self.db.unembedded_doc_group(request, cursor)?;
+            let group = self
+                .db
+                .unembedded_doc_group_in_collection(request, cursor, collection)?;
             let Some(last) = group.last() else {
                 break;
             };
@@ -441,10 +454,22 @@ impl Qmd {
         Ok(EmbedResult {
             embedded,
             chunks: total_chunks,
-            remaining: self.db.needs_embedding_count()?,
+            remaining: self.db.needs_embedding_count_in_collection(collection)?,
             failures,
             failure_messages,
         })
+    }
+
+    /// Generate embeddings for unembedded documents.
+    ///
+    /// A default run streams the whole unembedded corpus through bounded groups
+    /// of [`DEFAULT_EMBED_GROUP_SIZE`] unique content hashes. `batch` caps the
+    /// total number of documents embedded by this invocation while groups stay
+    /// bounded. Each group is fetched, generated, and published independently,
+    /// so completed work survives an unrelated failure and no whole-corpus or
+    /// whole-vector collection is retained in memory.
+    pub fn embed_with_batch(&mut self, batch: Option<usize>) -> Result<EmbedResult> {
+        self.embed_with_batch_in_collection(batch, None)
     }
 
     // ── Search ──────────────────────────────────────────────────────────
@@ -898,6 +923,11 @@ impl Qmd {
         self.db.needs_embedding_count()
     }
 
+    /// Count documents needing embedding in a collection.
+    pub fn needs_embedding_in_collection(&self, collection: Option<&str>) -> Result<usize> {
+        self.db.needs_embedding_count_in_collection(collection)
+    }
+
     // ── Maintenance ─────────────────────────────────────────────────────
 
     /// Delete inactive documents and orphaned data.
@@ -1114,9 +1144,16 @@ mod tests {
 
     /// Insert a document body into the CAS and register it under `docs/<path>`.
     fn seed_embed_doc(qmd: &Qmd, path: &str, body: &str) {
+        seed_embed_doc_with_collection(qmd, "docs", path, body);
+    }
+
+    /// Insert a document body into the CAS and register it under `<collection>/<path>`.
+    fn seed_embed_doc_with_collection(qmd: &Qmd, collection: &str, path: &str, body: &str) {
         let hash = hash_content(body);
         qmd.db().insert_content(&hash, body).unwrap();
-        qmd.db().upsert_document("docs", path, path, &hash).unwrap();
+        qmd.db()
+            .upsert_document(collection, path, path, &hash)
+            .unwrap();
     }
 
     /// Build a fusion result for a `docs/<path>` document with `score`.
@@ -1547,6 +1584,56 @@ mod tests {
         assert_eq!(result.failures, 0);
         assert_eq!(result.remaining, 3);
         assert_eq!(qmd.db().vector_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn embed_with_collection_filter_restricts_work() {
+        let temp = std::env::temp_dir().join(format!("qmd-test-embed-coll-{}", std::process::id()));
+        let dir_a = temp.join("a");
+        let dir_b = temp.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let mut qmd = Qmd::open_memory().unwrap();
+        qmd.register_collection(&Collection::new("coll_a", dir_a.to_string_lossy()))
+            .unwrap();
+        qmd.register_collection(&Collection::new("coll_b", dir_b.to_string_lossy()))
+            .unwrap();
+
+        seed_embed_doc_with_collection(&qmd, "coll_a", "a1.md", "content a 1");
+        seed_embed_doc_with_collection(&qmd, "coll_a", "a2.md", "content a 2");
+        seed_embed_doc_with_collection(&qmd, "coll_b", "b1.md", "content b 1");
+
+        qmd.embedder = Some(Box::new(FakeEngine::new(None)));
+
+        // Nonexistent collection returns error
+        assert!(
+            qmd.embed_with_batch_in_collection(None, Some("missing"))
+                .is_err()
+        );
+
+        // Embedding coll_a embeds only coll_a's 2 documents
+        let result_a = qmd
+            .embed_with_batch_in_collection(None, Some("coll_a"))
+            .unwrap();
+        assert_eq!(result_a.embedded, 2);
+        assert_eq!(result_a.remaining, 0);
+        assert_eq!(qmd.db().vector_count().unwrap(), 2);
+        assert_eq!(qmd.needs_embedding().unwrap(), 1);
+        assert_eq!(
+            qmd.needs_embedding_in_collection(Some("coll_b")).unwrap(),
+            1
+        );
+
+        // Embedding coll_b completes the rest
+        let result_b = qmd
+            .embed_with_batch_in_collection(None, Some("coll_b"))
+            .unwrap();
+        assert_eq!(result_b.embedded, 1);
+        assert_eq!(result_b.remaining, 0);
+        assert_eq!(qmd.needs_embedding().unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]

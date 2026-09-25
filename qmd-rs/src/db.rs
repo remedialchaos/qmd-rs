@@ -1042,12 +1042,73 @@ impl Db {
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<(String, String, String)>> {
+        self.unembedded_docs_with_limit_in_collection(limit, None)
+    }
+
+    /// Documents that need embedding, optionally limited for a batch run and scoped to a collection.
+    ///
+    /// Results are unique by content hash; `path` is the smallest active path
+    /// for that hash, providing a deterministic diagnostic alias.
+    pub fn unembedded_docs_with_limit_in_collection(
+        &self,
+        limit: Option<usize>,
+        collection: Option<&str>,
+    ) -> Result<Vec<(String, String, String)>> {
         let max = limit.unwrap_or(usize::MAX);
         Ok(self
-            .unembedded_doc_group(max, 0)?
+            .unembedded_doc_group_in_collection(max, 0, collection)?
             .into_iter()
             .map(|(hash, path, body, _)| (hash, path, body))
             .collect())
+    }
+
+    /// Fetch one bounded work group of unembedded documents, optionally filtered by collection.
+    ///
+    /// Rows are unique by content hash and returned as
+    /// `(hash, alias_path, body, first_document_id)`, ordered by the id of the
+    /// document that first referenced the hash. `after_first_id` pages through
+    /// the corpus without materializing or re-selecting already-fetched work.
+    pub fn unembedded_doc_group_in_collection(
+        &self,
+        limit: usize,
+        after_first_id: i64,
+        collection: Option<&str>,
+    ) -> Result<Vec<(String, String, String, i64)>> {
+        let bound = i64::try_from(limit).unwrap_or(i64::MAX);
+        let results = if let Some(col) = collection {
+            let sql = r"SELECT d.hash, MIN(d.path), c.doc, MIN(d.id)
+                  FROM documents d
+                  JOIN content c ON c.hash = d.hash
+                  LEFT JOIN content_vectors v
+                    ON d.hash = v.hash AND v.seq = 0 AND v.model = 'default:complete'
+                  WHERE d.active = 1 AND d.collection = ?1 AND v.hash IS NULL
+                  GROUP BY d.hash
+                  HAVING MIN(d.id) > ?2
+                  ORDER BY MIN(d.id)
+                  LIMIT ?3";
+            let mut stmt = self.conn.prepare(sql)?;
+            let mapper =
+                |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+            stmt.query_map(params![col, after_first_id, bound], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let sql = r"SELECT d.hash, MIN(d.path), c.doc, MIN(d.id)
+                  FROM documents d
+                  JOIN content c ON c.hash = d.hash
+                  LEFT JOIN content_vectors v
+                    ON d.hash = v.hash AND v.seq = 0 AND v.model = 'default:complete'
+                  WHERE d.active = 1 AND v.hash IS NULL
+                  GROUP BY d.hash
+                  HAVING MIN(d.id) > ?1
+                  ORDER BY MIN(d.id)
+                  LIMIT ?2";
+            let mut stmt = self.conn.prepare(sql)?;
+            let mapper =
+                |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+            stmt.query_map(params![after_first_id, bound], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(results)
     }
 
     /// Fetch one bounded work group of unembedded documents.
@@ -1061,24 +1122,7 @@ impl Db {
         limit: usize,
         after_first_id: i64,
     ) -> Result<Vec<(String, String, String, i64)>> {
-        let bound = i64::try_from(limit).unwrap_or(i64::MAX);
-        let sql = r"SELECT d.hash, MIN(d.path), c.doc, MIN(d.id)
-              FROM documents d
-              JOIN content c ON c.hash = d.hash
-              LEFT JOIN content_vectors v
-                ON d.hash = v.hash AND v.seq = 0 AND v.model = 'default:complete'
-              WHERE d.active = 1 AND v.hash IS NULL
-              GROUP BY d.hash
-              HAVING MIN(d.id) > ?1
-              ORDER BY MIN(d.id)
-              LIMIT ?2";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mapper =
-            |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
-        let results = stmt
-            .query_map(params![after_first_id, bound], mapper)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(results)
+        self.unembedded_doc_group_in_collection(limit, after_first_id, None)
     }
 
     /// Vector similarity search using sqlite-vec native KNN.
@@ -1296,17 +1340,34 @@ impl Db {
         )?)
     }
 
+    /// Count documents needing embedding, optionally scoped to a collection.
+    pub fn needs_embedding_count_in_collection(&self, collection: Option<&str>) -> Result<usize> {
+        if let Some(col) = collection {
+            Ok(self.conn.query_row(
+                r"SELECT COUNT(DISTINCT d.hash)
+                  FROM documents d
+                  LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+                    AND v.model = 'default:complete'
+                  WHERE d.active = 1 AND d.collection = ?1 AND v.hash IS NULL",
+                params![col],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?)
+        } else {
+            Ok(self.conn.query_row(
+                r"SELECT COUNT(DISTINCT d.hash)
+                  FROM documents d
+                  LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+                    AND v.model = 'default:complete'
+                  WHERE d.active = 1 AND v.hash IS NULL",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?)
+        }
+    }
+
     /// Count documents needing embedding.
     pub fn needs_embedding_count(&self) -> Result<usize> {
-        Ok(self.conn.query_row(
-            r"SELECT COUNT(DISTINCT d.hash)
-              FROM documents d
-              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-                AND v.model = 'default:complete'
-              WHERE d.active = 1 AND v.hash IS NULL",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?)
+        self.needs_embedding_count_in_collection(None)
     }
 
     /// Get full index status.
@@ -2135,6 +2196,54 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(db.unembedded_docs_with_limit(Some(2)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_unembedded_docs_scoped_to_collection() {
+        let db = mem_db();
+        for i in 0..3 {
+            let body = format!("doc a {i}");
+            let hash = hash_content(&body);
+            db.insert_content(&hash, &body).unwrap();
+            db.upsert_document("coll_a", &format!("{i}.md"), "Doc", &hash)
+                .unwrap();
+        }
+        for i in 0..2 {
+            let body = format!("doc b {i}");
+            let hash = hash_content(&body);
+            db.insert_content(&hash, &body).unwrap();
+            db.upsert_document("coll_b", &format!("{i}.md"), "Doc", &hash)
+                .unwrap();
+        }
+
+        assert_eq!(db.needs_embedding_count().unwrap(), 5);
+        assert_eq!(
+            db.needs_embedding_count_in_collection(Some("coll_a"))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.needs_embedding_count_in_collection(Some("coll_b"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.needs_embedding_count_in_collection(Some("nonexistent"))
+                .unwrap(),
+            0
+        );
+
+        let docs_a = db
+            .unembedded_docs_with_limit_in_collection(None, Some("coll_a"))
+            .unwrap();
+        assert_eq!(docs_a.len(), 3);
+        assert!(docs_a.iter().all(|(_, _, body)| body.starts_with("doc a")));
+
+        let docs_b = db
+            .unembedded_docs_with_limit_in_collection(Some(1), Some("coll_b"))
+            .unwrap();
+        assert_eq!(docs_b.len(), 1);
+        assert!(docs_b[0].2.starts_with("doc b"));
     }
 
     #[test]
