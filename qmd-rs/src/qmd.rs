@@ -187,11 +187,52 @@ impl Qmd {
     /// Register (or update) a collection. Does NOT index files.
     /// Call [`update`](Self::update) afterwards to scan the filesystem.
     pub fn register_collection(&self, coll: &Collection) -> Result<()> {
-        let path = Path::new(&coll.path);
-        if !path.is_dir() {
-            return Err(Error::Config(format!("not a directory: {}", coll.path)));
+        if coll.is_dir_backed() {
+            let path = Path::new(&coll.path);
+            if !path.is_dir() {
+                return Err(Error::Config(format!("not a directory: {}", coll.path)));
+            }
         }
         self.db.upsert_collection(coll)
+    }
+
+    /// Register a direct/record-based collection that holds documents ingested via [`upsert_record`](Self::upsert_record).
+    pub fn register_direct_collection(&self, name: &str) -> Result<()> {
+        self.register_collection(&Collection::direct(name))
+    }
+
+    /// Ingest or update a document record directly into a collection without reading from disk.
+    ///
+    /// Inserts the body content into CAS, upserts the document record under
+    /// `<collection>/<path>`, and triggers immediate FTS5 index synchronization.
+    /// If the collection is not registered yet, it is automatically registered as a direct collection.
+    pub fn upsert_record(
+        &self,
+        collection: &str,
+        path: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        if self.db.get_collection(collection)?.is_none() {
+            let coll = Collection::direct(collection);
+            self.db.upsert_collection(&coll)?;
+        }
+        let hash = hash_content(body);
+        self.db.insert_content(&hash, body)?;
+        self.db.upsert_document(collection, path, title, &hash)?;
+        Ok(())
+    }
+
+    /// Deactivate/remove a document record from a collection.
+    ///
+    /// Marks the document inactive and immediately removes it from the FTS5 index.
+    pub fn delete_record(&self, collection: &str, path: &str) -> Result<()> {
+        self.db.deactivate(collection, path)
+    }
+
+    /// Get a document record by collection and path.
+    pub fn get_record(&self, collection: &str, path: &str) -> Result<Option<Document>> {
+        self.db.get_document(collection, path)
     }
 
     /// Remove a collection and all its documents.
@@ -252,6 +293,9 @@ impl Qmd {
         let mut total = UpdateResult::default();
 
         for coll in colls {
+            if !coll.is_dir_backed() {
+                continue;
+            }
             let r = self.index_collection(coll)?;
             total.indexed += r.indexed;
             total.updated += r.updated;
@@ -1094,6 +1138,55 @@ mod tests {
             .expect("punctuation-only FTS query should be safe");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn direct_collection_and_record_crud_lifecycle() {
+        let qmd = Qmd::open_memory().expect("open in-memory qmd");
+
+        // 1. Direct collection registration
+        let coll = Collection::direct("episodic");
+        assert!(!coll.is_dir_backed());
+        qmd.register_collection(&coll)
+            .expect("register direct collection");
+
+        // 2. Direct record upsert
+        qmd.upsert_record(
+            "episodic",
+            "obs_001",
+            "Compiler Fix",
+            "Fixed rusqlite links conflict with bundled features in workspace",
+        )
+        .expect("upsert record");
+
+        // 3. FTS5 retrieval works immediately
+        let results = qmd.search_fts("bundled conflict", 10).expect("fts search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc.collection, "episodic");
+        assert_eq!(results[0].doc.path, "obs_001");
+        assert_eq!(results[0].doc.title, "Compiler Fix");
+
+        // 4. Record fetch
+        let doc = qmd
+            .get_record("episodic", "obs_001")
+            .expect("get record")
+            .expect("record exists");
+        assert_eq!(
+            doc.body.as_deref(),
+            Some("Fixed rusqlite links conflict with bundled features in workspace")
+        );
+
+        // 5. Update does not attempt to walk directory for direct collections
+        let update_res = qmd.update(None).expect("update should succeed");
+        assert_eq!(update_res.indexed, 0);
+
+        // 6. Delete record
+        qmd.delete_record("episodic", "obs_001")
+            .expect("delete record");
+        let results_after = qmd
+            .search_fts("bundled conflict", 10)
+            .expect("fts search after delete");
+        assert!(results_after.is_empty());
     }
 
     /// Deterministic test double for the embedding engine: records every

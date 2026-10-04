@@ -140,6 +140,24 @@ impl Collection {
         }
     }
 
+    /// Create a direct/record-based collection that holds documents ingested directly via API rather than a filesystem directory.
+    #[must_use]
+    pub fn direct(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: String::new(),
+            pattern: default_pattern(),
+            ignore: Vec::new(),
+            context: HashMap::new(),
+        }
+    }
+
+    /// Whether this collection is backed by an on-disk directory.
+    #[must_use]
+    pub fn is_dir_backed(&self) -> bool {
+        !self.path.is_empty() && self.path != ":memory:" && !self.path.starts_with("virtual:")
+    }
+
     /// Set a custom glob pattern.
     #[must_use]
     pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
