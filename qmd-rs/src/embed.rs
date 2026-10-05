@@ -49,7 +49,7 @@ fn batch_ranges(len: usize) -> Vec<std::ops::Range<usize>> {
 /// Production uses [`Embedder`]; the trait exists so embedding scheduling and
 /// failure handling can be exercised deterministically without loading an ONNX
 /// model or touching the network.
-pub trait EmbeddingEngine {
+pub trait EmbeddingEngine: Send {
     /// Embed a single query string.
     fn embed_query(&mut self, query: &str) -> Result<Vec<f32>>;
 
