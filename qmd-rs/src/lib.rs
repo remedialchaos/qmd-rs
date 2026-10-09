@@ -32,12 +32,13 @@ pub mod search;
 
 pub use db::{
     Collection, CollectionInfo, DoctorCheck, DoctorCheckStatus, DoctorReport, Document,
-    DocumentSummary, EmbeddingCompatibility, IndexStatus, SearchResult, SearchSource, hash_content,
+    DocumentSummary, EmbeddingCompatibility, IndexStatus, OpenOptions, SearchResult, SearchSource,
+    hash_content,
 };
 pub use error::{Error, Result};
 pub use llm::{LlmConfig, LlmProvider, expand_query, parse_or_expand_query};
 pub use qmd::{
-    EmbedResult, IndexFailure, IndexResult, MultiGetItem, Qmd, UpdateResult, parse_path_range,
-    slice_body,
+    EmbedResult, IndexFailure, IndexResult, MultiGetItem, Qmd, UpdateResult, WriteBatch,
+    parse_path_range, slice_body,
 };
 pub use search::{Query, QueryType};

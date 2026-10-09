@@ -12,9 +12,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
@@ -35,6 +37,42 @@ fn now_rfc3339() -> String {
     let min = (rem % 3600) / 60;
     let sec = rem % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Read the persisted embedding fingerprint on an existing connection.
+fn embedding_fingerprint_on_conn(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM store_config WHERE key = 'embedding_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Reject vectors produced under another or unknown contract.
+fn validate_embedding_fingerprint_on_conn(conn: &Connection, expected: &str) -> Result<()> {
+    let vectors: i64 =
+        conn.query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))?;
+    match embedding_fingerprint_on_conn(conn)? {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::Config(format!(
+            "embedding fingerprint mismatch (stored {actual}, expected {expected}); run qmd embed --force"
+        ))),
+        None if vectors > 0 => Err(Error::Config(
+            "legacy embeddings have no trustworthy fingerprint; run qmd embed --force".into(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Create the sqlite-vec table if absent. Call only inside a write transaction.
+fn ensure_vec_table_on_conn(conn: &Connection, dims: usize) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(embedding float[{dims}]);"
+    ))?;
+    Ok(())
 }
 
 /// Insert an embedding row using the supplied SQLite connection.
@@ -356,26 +394,137 @@ pub struct Db {
     dims: Option<usize>,
 }
 
+/// Current schema marker stored under `store_config.schema_version`.
+///
+/// Bump when DDL or trigger definitions change so existing databases re-run
+/// the migration once.
+const SCHEMA_VERSION: &str = "2";
+
+/// Connection options for [`Db::open_with_options`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    /// How long a statement waits on a competing writer before `SQLITE_BUSY`.
+    pub busy_timeout: Duration,
+    /// Reject writes on this connection (`PRAGMA query_only`).
+    pub query_only: bool,
+}
+
+impl OpenOptions {
+    /// Set the busy timeout.
+    #[must_use]
+    pub const fn busy_timeout(mut self, timeout: Duration) -> Self {
+        self.busy_timeout = timeout;
+        self
+    }
+
+    /// Set whether the connection rejects writes.
+    #[must_use]
+    pub const fn query_only(mut self, query_only: bool) -> Self {
+        self.query_only = query_only;
+        self
+    }
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout: Duration::from_secs(5),
+            query_only: false,
+        }
+    }
+}
+
 impl Db {
     /// Open (or create) a database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_options(path, &OpenOptions::default())
+    }
+
+    /// Open (or create) a database with explicit connection options.
+    pub fn open_with_options(path: &Path, options: &OpenOptions) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         Self::register_sqlite_vec();
-        let conn = Connection::open(path)?;
-        let db = Self { conn, dims: None };
-        db.migrate()?;
-        Ok(db)
+        Self::configure(Connection::open(path)?, options)
     }
 
     /// Open an in-memory database (useful for tests).
     pub fn open_memory() -> Result<Self> {
         Self::register_sqlite_vec();
-        let conn = Connection::open_in_memory()?;
+        Self::configure(Connection::open_in_memory()?, &OpenOptions::default())
+    }
+
+    /// Apply connection pragmas, then migrate.
+    fn configure(conn: Connection, options: &OpenOptions) -> Result<Self> {
+        conn.busy_timeout(options.busy_timeout)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Self::enable_wal(&conn, options.busy_timeout)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?;
         let db = Self { conn, dims: None };
         db.migrate()?;
+        if options.query_only {
+            db.conn.pragma_update(None, "query_only", "ON")?;
+        }
         Ok(db)
+    }
+
+    /// Switch to WAL, retrying while another connection holds the database.
+    fn enable_wal(conn: &Connection, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Run `f` inside a `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Taking the write lock up front avoids `SQLITE_BUSY_SNAPSHOT`, which a
+    /// deferred read-then-write transaction hits in WAL mode. Commits on `Ok`;
+    /// rolls back on `Err` or panic. Re-entrant: when a transaction is already
+    /// open on this connection, `f` joins it and the outermost call commits.
+    pub fn write_tx<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let value = f(self)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Read a `store_config` value.
+    pub fn cfg_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM store_config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Insert or replace a `store_config` value.
+    pub fn cfg_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO store_config(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Open an existing index without migrations or write access.
@@ -397,13 +546,35 @@ impl Db {
         });
     }
 
-    /// Run schema migrations.
-    fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r"
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
+    /// Whether the schema marker says migrations are already applied.
+    fn schema_current(&self) -> Result<bool> {
+        let has_config = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_config'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(has_config && self.cfg_get("schema_version")?.as_deref() == Some(SCHEMA_VERSION))
+    }
 
+    /// Run schema migrations.
+    ///
+    /// Current databases return without writing. Otherwise all DDL runs in one
+    /// `BEGIN IMMEDIATE`, re-checking the marker once the lock is held so
+    /// concurrent openers migrate exactly once.
+    fn migrate(&self) -> Result<()> {
+        if self.schema_current()? {
+            return Ok(());
+        }
+        self.write_tx(|db| {
+            if db.schema_current()? {
+                return Ok(());
+            }
+            db.conn.execute_batch(
+                r"
             CREATE TABLE IF NOT EXISTS content (
                 hash       TEXT PRIMARY KEY,
                 doc        TEXT NOT NULL,
@@ -454,9 +625,10 @@ impl Db {
                 value TEXT
             );
             ",
-        )?;
-        self.ensure_fts_triggers()?;
-        Ok(())
+            )?;
+            db.ensure_fts_triggers()?;
+            db.cfg_set("schema_version", SCHEMA_VERSION)
+        })
     }
 
     /// Create FTS synchronization triggers if absent, and upgrade a stale
@@ -470,7 +642,9 @@ impl Db {
     /// databases carry the old trigger, so the check must compare trigger
     /// SQL, not just presence of `documents_ai`.
     fn ensure_fts_triggers(&self) -> Result<()> {
-        const AU_SQL: &str = r"CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+        // SQLite stores trigger SQL as `CREATE TRIGGER <name> ...` without
+        // `IF NOT EXISTS`, so this definition doubles as the comparison text.
+        const AU_DEF: &str = r"documents_au AFTER UPDATE ON documents BEGIN
                     DELETE FROM documents_fts WHERE rowid = old.id;
                     INSERT INTO documents_fts(rowid, filepath, title, body)
                     SELECT new.id,
@@ -478,38 +652,29 @@ impl Db {
                            new.title,
                            (SELECT doc FROM content WHERE hash = new.hash)
                     WHERE new.active = 1;
-                END;";
+                END";
 
-        let exists: bool = self
+        // An existing DB may still carry the broken documents_au; drop it
+        // only when its definition differs from the current one.
+        let au_sql: Option<String> = self
             .conn
             .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='documents_ai'",
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='documents_au'",
                 [],
-                |_| Ok(true),
+                |row| row.get(0),
             )
-            .unwrap_or(false);
-
-        if exists {
-            // An existing DB may still carry the broken documents_au; repair
-            // it only when its definition differs from the current one.
-            let au_sql: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='documents_au'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if au_sql.as_deref() != Some(AU_SQL) {
-                self.conn
-                    .execute_batch(&format!("DROP TRIGGER IF EXISTS documents_au; {AU_SQL};"))?;
-            }
-            return Ok(());
+            .optional()?;
+        if au_sql
+            .as_deref()
+            .is_some_and(|sql| sql != format!("CREATE TRIGGER {AU_DEF}"))
+        {
+            self.conn
+                .execute_batch("DROP TRIGGER IF EXISTS documents_au;")?;
         }
 
         self.conn.execute_batch(&format!(
             r"
-                CREATE TRIGGER documents_ai AFTER INSERT ON documents
+                CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
                 WHEN new.active = 1
                 BEGIN
                     INSERT INTO documents_fts(rowid, filepath, title, body)
@@ -520,32 +685,13 @@ impl Db {
                     WHERE new.active = 1;
                 END;
 
-                CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+                CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
                     DELETE FROM documents_fts WHERE rowid = old.id;
                 END;
 
-                {AU_SQL};
+                CREATE TRIGGER IF NOT EXISTS {AU_DEF};
                 ",
         ))?;
-        Ok(())
-    }
-
-    /// Create the sqlite-vec virtual table for the given dimensionality.
-    fn ensure_vec_table(&self, dims: usize) -> Result<()> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !exists {
-            self.conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[{dims}]);"
-            ))?;
-        }
         Ok(())
     }
 
@@ -601,43 +747,47 @@ impl Db {
 
     /// Delete a collection registration and its documents.
     pub fn delete_collection(&self, name: &str) -> Result<usize> {
-        let count = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE collection = ?1",
-            params![name],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
-        self.conn
-            .execute("DELETE FROM documents WHERE collection = ?1", params![name])?;
-        self.conn.execute(
-            "DELETE FROM store_collections WHERE name = ?1",
-            params![name],
-        )?;
-        self.cleanup()?;
-        Ok(count)
+        self.write_tx(|db| {
+            let count = db.conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE collection = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+            db.conn
+                .execute("DELETE FROM documents WHERE collection = ?1", params![name])?;
+            db.conn.execute(
+                "DELETE FROM store_collections WHERE name = ?1",
+                params![name],
+            )?;
+            db.cleanup()?;
+            Ok(count)
+        })
     }
 
     /// Rename a collection.
     pub fn rename_collection(&self, old_name: &str, new_name: &str) -> Result<()> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM store_collections WHERE name = ?1",
-                params![new_name],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if exists {
-            return Err(Error::CollectionExists(new_name.to_string()));
-        }
-        self.conn.execute(
-            "UPDATE store_collections SET name = ?1 WHERE name = ?2",
-            params![new_name, old_name],
-        )?;
-        self.conn.execute(
-            "UPDATE documents SET collection = ?1 WHERE collection = ?2",
-            params![new_name, old_name],
-        )?;
-        Ok(())
+        self.write_tx(|db| {
+            let exists: bool = db
+                .conn
+                .query_row(
+                    "SELECT 1 FROM store_collections WHERE name = ?1",
+                    params![new_name],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if exists {
+                return Err(Error::CollectionExists(new_name.to_string()));
+            }
+            db.conn.execute(
+                "UPDATE store_collections SET name = ?1 WHERE name = ?2",
+                params![new_name, old_name],
+            )?;
+            db.conn.execute(
+                "UPDATE documents SET collection = ?1 WHERE collection = ?2",
+                params![new_name, old_name],
+            )?;
+            Ok(())
+        })
     }
 
     // ── Context management ──────────────────────────────────────────────
@@ -986,20 +1136,22 @@ impl Db {
         model: &str,
         expected_fingerprint: &str,
     ) -> Result<()> {
-        self.validate_embedding_fingerprint(expected_fingerprint)?;
-        if self.dims.is_none() {
-            self.dims = Some(embedding.len());
-            self.ensure_vec_table(embedding.len())?;
-        } else if self.dims != Some(embedding.len()) {
+        let dims = embedding.len();
+        if self.dims.is_some_and(|d| d != dims) {
             return Err(Error::Config("embedding dimensions do not match".into()));
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_embedding_fingerprint_on_conn(&tx, expected_fingerprint)?;
+        ensure_vec_table_on_conn(&tx, dims)?;
         insert_embedding_on_conn(&tx, hash, seq, pos, embedding, model)?;
         tx.execute(
             "INSERT INTO store_config(key, value) VALUES ('embedding_fingerprint', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![expected_fingerprint],
         )?;
         tx.commit()?;
+        self.dims = Some(dims);
         Ok(())
     }
 
@@ -1012,16 +1164,15 @@ impl Db {
         if embeddings.is_empty() {
             return Ok(());
         }
-        self.validate_embedding_fingerprint(fingerprint)?;
         let dims = embeddings[0].3.len();
         if embeddings.iter().any(|(_, _, _, e)| e.len() != dims) {
             return Err(Error::Config("embedding dimensions do not match".into()));
         }
-        if self.dims.is_none() {
-            self.dims = Some(dims);
-            self.ensure_vec_table(dims)?;
-        }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_embedding_fingerprint_on_conn(&tx, fingerprint)?;
+        ensure_vec_table_on_conn(&tx, dims)?;
         for (hash, seq, pos, embedding) in embeddings {
             let model = if *seq == 0 {
                 "default:complete"
@@ -1035,6 +1186,7 @@ impl Db {
             params![fingerprint],
         )?;
         tx.commit()?;
+        self.dims = Some(dims);
         Ok(())
     }
 
@@ -1623,14 +1775,7 @@ impl Db {
 
     /// Read the persisted embedding contract fingerprint, if established.
     pub fn embedding_fingerprint(&self) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM store_config WHERE key = 'embedding_fingerprint'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        embedding_fingerprint_on_conn(&self.conn)
     }
 
     /// Establish the embedding contract only while no vectors exist.
@@ -1656,60 +1801,53 @@ impl Db {
 
     /// Reject vectors that were produced under another or unknown contract.
     pub fn validate_embedding_fingerprint(&self, expected: &str) -> Result<()> {
-        let vectors: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))?;
-        match self.embedding_fingerprint()? {
-            Some(actual) if actual == expected => Ok(()),
-            Some(actual) => Err(Error::Config(format!(
-                "embedding fingerprint mismatch (stored {actual}, expected {expected}); run qmd embed --force"
-            ))),
-            None if vectors > 0 => Err(Error::Config(
-                "legacy embeddings have no trustworthy fingerprint; run qmd embed --force".into(),
-            )),
-            None => Ok(()),
-        }
+        validate_embedding_fingerprint_on_conn(&self.conn, expected)
     }
 
     // ── Maintenance ────────────────────────────────────────────────────
 
     /// Delete inactive documents and orphaned content/vectors.
     pub fn cleanup(&self) -> Result<usize> {
-        let c1 = self
-            .conn
-            .execute("DELETE FROM documents WHERE active = 0", [])?;
-        let c2 = self.conn.execute(
-            "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            [],
-        )?;
-        let orphans: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                r"SELECT cv.rowid FROM content_vectors cv
-                  WHERE cv.hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            )?;
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for rid in &orphans {
-            let _ = self
+        self.write_tx(|db| {
+            let c1 = db
                 .conn
-                .execute("DELETE FROM vec_embeddings WHERE rowid = ?1", params![rid]);
-        }
-        let c3 = self.conn.execute(
-            "DELETE FROM content_vectors WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            [],
-        )?;
-        Ok(c1 + c2 + c3)
+                .execute("DELETE FROM documents WHERE active = 0", [])?;
+            let c2 = db.conn.execute(
+                "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
+                [],
+            )?;
+            let orphans: Vec<i64> = {
+                let mut stmt = db.conn.prepare(
+                    r"SELECT cv.rowid FROM content_vectors cv
+                      WHERE cv.hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
+                )?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for rid in &orphans {
+                let _ = db
+                    .conn
+                    .execute("DELETE FROM vec_embeddings WHERE rowid = ?1", params![rid]);
+            }
+            let c3 = db.conn.execute(
+                "DELETE FROM content_vectors WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
+                [],
+            )?;
+            Ok(c1 + c2 + c3)
+        })
     }
 
     /// Clear all embeddings.
     pub fn clear_embeddings(&mut self) -> Result<usize> {
-        let c = self.conn.execute("DELETE FROM content_vectors", [])?;
-        self.conn.execute(
-            "DELETE FROM store_config WHERE key = 'embedding_fingerprint'",
-            [],
-        )?;
-        let _ = self.conn.execute("DROP TABLE IF EXISTS vec_embeddings", []);
+        let c = self.write_tx(|db| {
+            let c = db.conn.execute("DELETE FROM content_vectors", [])?;
+            db.conn.execute(
+                "DELETE FROM store_config WHERE key = 'embedding_fingerprint'",
+                [],
+            )?;
+            let _ = db.conn.execute("DROP TABLE IF EXISTS vec_embeddings", []);
+            Ok(c)
+        })?;
         self.dims = None;
         Ok(c)
     }
