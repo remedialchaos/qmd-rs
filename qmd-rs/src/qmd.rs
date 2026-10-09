@@ -28,6 +28,50 @@ use crate::error::{Error, Result};
 use crate::rerank::{Reranker, Scored};
 use crate::search::{self, Query, QueryType};
 
+/// Writes available inside [`Qmd::write_batch`].
+#[derive(Debug)]
+pub struct WriteBatch<'a> {
+    /// Connection holding the open write transaction.
+    db: &'a Db,
+}
+
+impl WriteBatch<'_> {
+    /// Upsert a document record, auto-registering a direct collection.
+    /// See [`Qmd::upsert_record`].
+    pub fn upsert_record(
+        &self,
+        collection: &str,
+        path: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        if self.db.get_collection(collection)?.is_none() {
+            self.db.upsert_collection(&Collection::direct(collection))?;
+        }
+        let hash = hash_content(body);
+        self.db.insert_content(&hash, body)?;
+        self.db.upsert_document(collection, path, title, &hash)
+    }
+
+    /// Deactivate a document record. See [`Qmd::delete_record`].
+    pub fn delete_record(&self, collection: &str, path: &str) -> Result<()> {
+        self.db.deactivate(collection, path)
+    }
+
+    /// Read a `store_config` value.
+    pub fn cfg_get(&self, key: &str) -> Result<Option<String>> {
+        self.db.cfg_get(key)
+    }
+
+    /// Set a `store_config` value.
+    pub fn cfg_set(&self, key: &str, value: &str) -> Result<()> {
+        self.db.cfg_set(key, value)
+    }
+}
+
+/// Maximum files written per transaction while indexing, bounding lock time.
+const INDEX_WRITE_CHUNK: usize = 64;
+
 /// The main qmd handle.
 ///
 /// Owns the SQLite database, embedding model, and reranker — all lazily
@@ -213,14 +257,7 @@ impl Qmd {
         title: &str,
         body: &str,
     ) -> Result<()> {
-        if self.db.get_collection(collection)?.is_none() {
-            let coll = Collection::direct(collection);
-            self.db.upsert_collection(&coll)?;
-        }
-        let hash = hash_content(body);
-        self.db.insert_content(&hash, body)?;
-        self.db.upsert_document(collection, path, title, &hash)?;
-        Ok(())
+        self.write_batch(|batch| batch.upsert_record(collection, path, title, body))
     }
 
     /// Deactivate/remove a document record from a collection.
@@ -228,6 +265,14 @@ impl Qmd {
     /// Marks the document inactive and immediately removes it from the FTS5 index.
     pub fn delete_record(&self, collection: &str, path: &str) -> Result<()> {
         self.db.deactivate(collection, path)
+    }
+
+    /// Run several writes atomically in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Commits when `f` returns `Ok`; any error rolls back every write made
+    /// through the [`WriteBatch`].
+    pub fn write_batch<T>(&self, f: impl FnOnce(&WriteBatch<'_>) -> Result<T>) -> Result<T> {
+        self.db.write_tx(|db| f(&WriteBatch { db }))
     }
 
     /// Get a document record by collection and path.
@@ -308,6 +353,26 @@ impl Qmd {
         Ok(total)
     }
 
+    /// Write queued `(hash, content, path, title)` upserts in one transaction.
+    fn flush_upserts(
+        &self,
+        collection: &str,
+        pending: &mut Vec<(String, String, String, String)>,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.db.write_tx(|db| {
+            for (hash, content, rel, title) in pending.iter() {
+                db.insert_content(hash, content)?;
+                db.upsert_document(collection, rel, title, hash)?;
+            }
+            Ok(())
+        })?;
+        pending.clear();
+        Ok(())
+    }
+
     /// Index a single collection by scanning the filesystem.
     fn index_collection(&self, coll: &Collection) -> Result<IndexResult> {
         let base = Path::new(&coll.path);
@@ -324,6 +389,7 @@ impl Qmd {
         let mut updated = 0usize;
         let mut unchanged = 0usize;
         let mut failures = Vec::new();
+        let mut pending: Vec<(String, String, String, String)> = Vec::new();
 
         // Paths still present on disk after this scan. A path whose source is
         // empty/whitespace-only is removed from this set so the trailing
@@ -372,16 +438,25 @@ impl Qmd {
                 indexed += 1;
             }
 
-            self.db.insert_content(&hash, &content)?;
-            self.db.upsert_document(&coll.name, &rel, &title, &hash)?;
-        }
-
-        let mut removed = 0usize;
-        for path in &existing_set {
-            if !new_paths.contains(*path) {
-                self.db.deactivate(&coll.name, path)?;
-                removed += 1;
+            pending.push((hash, content, rel, title));
+            if pending.len() >= INDEX_WRITE_CHUNK {
+                self.flush_upserts(&coll.name, &mut pending)?;
             }
+        }
+        self.flush_upserts(&coll.name, &mut pending)?;
+
+        let stale: Vec<&str> = existing_set
+            .iter()
+            .copied()
+            .filter(|path| !new_paths.contains(*path))
+            .collect();
+        let removed = stale.len();
+        for chunk in stale.chunks(INDEX_WRITE_CHUNK) {
+            self.db.write_tx(|db| {
+                chunk
+                    .iter()
+                    .try_for_each(|path| db.deactivate(&coll.name, path))
+            })?;
         }
 
         Ok(IndexResult {
