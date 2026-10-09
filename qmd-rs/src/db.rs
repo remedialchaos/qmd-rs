@@ -392,7 +392,12 @@ pub struct Db {
     pub(crate) conn: Connection,
     /// Embedding dimensionality (set after first embedding insert).
     dims: Option<usize>,
+    /// Budget for acquiring the write lock, shared with the busy handler.
+    busy_timeout: Duration,
 }
+
+/// Longest pause between write-lock attempts.
+const WRITE_LOCK_MAX_POLL: Duration = Duration::from_millis(2);
 
 /// Current schema marker stored under `store_config.schema_version`.
 ///
@@ -463,7 +468,11 @@ impl Db {
         Self::enable_wal(&conn, options.busy_timeout)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)?;
-        let db = Self { conn, dims: None };
+        let db = Self {
+            conn,
+            dims: None,
+            busy_timeout: options.busy_timeout,
+        };
         db.migrate()?;
         if options.query_only {
             db.conn.pragma_update(None, "query_only", "ON")?;
@@ -499,10 +508,40 @@ impl Db {
         if !self.conn.is_autocommit() {
             return f(self);
         }
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let tx = self.begin_immediate()?;
         let value = f(self)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Start a `BEGIN IMMEDIATE` transaction, polling for the write lock.
+    ///
+    /// SQLite's built-in busy handler backs off in steps up to 100 ms, so a
+    /// writer that loses a few races sleeps for hundreds of milliseconds while
+    /// the lock is held for about one. Here the handler is disabled for the
+    /// `BEGIN` and the lock is retried every 100 us to 2 ms with jitter until
+    /// the connection's busy timeout elapses. Statements inside the
+    /// transaction keep the normal busy handler.
+    fn begin_immediate(&self) -> Result<Transaction<'_>> {
+        let deadline = Instant::now() + self.busy_timeout;
+        self.conn.busy_timeout(Duration::ZERO)?;
+        let mut pause = Duration::from_micros(100);
+        let outcome = loop {
+            match Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate) {
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+                {
+                    let jitter = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |d| u64::from(d.subsec_nanos()) % 64);
+                    std::thread::sleep(pause + pause * u32::try_from(jitter).unwrap_or(0) / 128);
+                    pause = (pause * 2).min(WRITE_LOCK_MAX_POLL);
+                }
+                other => break other,
+            }
+        };
+        self.conn.busy_timeout(self.busy_timeout)?;
+        Ok(outcome?)
     }
 
     /// Read a `store_config` value.
@@ -531,7 +570,11 @@ impl Db {
     pub fn open_read_only(path: &Path) -> Result<Self> {
         Self::register_sqlite_vec();
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Ok(Self { conn, dims: None })
+        Ok(Self {
+            conn,
+            dims: None,
+            busy_timeout: OpenOptions::default().busy_timeout,
+        })
     }
 
     /// Register sqlite-vec before any SQLite connection is opened.
@@ -794,6 +837,11 @@ impl Db {
 
     /// Set or update a path-scoped context for a collection.
     pub fn set_context(&self, collection: &str, path_prefix: &str, text: &str) -> Result<bool> {
+        self.write_tx(|db| db.set_context_locked(collection, path_prefix, text))
+    }
+
+    /// Body of [`Self::set_context`] that runs inside the write transaction.
+    fn set_context_locked(&self, collection: &str, path_prefix: &str, text: &str) -> Result<bool> {
         let exists: bool = self
             .conn
             .query_row(
@@ -829,6 +877,11 @@ impl Db {
 
     /// Remove a path-scoped context from a collection.
     pub fn remove_context(&self, collection: &str, path_prefix: &str) -> Result<bool> {
+        self.write_tx(|db| db.remove_context_locked(collection, path_prefix))
+    }
+
+    /// Body of [`Self::remove_context`] that runs inside the write transaction.
+    fn remove_context_locked(&self, collection: &str, path_prefix: &str) -> Result<bool> {
         let exists: bool = self
             .conn
             .query_row(
@@ -1140,9 +1193,7 @@ impl Db {
         if self.dims.is_some_and(|d| d != dims) {
             return Err(Error::Config("embedding dimensions do not match".into()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.begin_immediate()?;
         validate_embedding_fingerprint_on_conn(&tx, expected_fingerprint)?;
         ensure_vec_table_on_conn(&tx, dims)?;
         insert_embedding_on_conn(&tx, hash, seq, pos, embedding, model)?;
@@ -1168,9 +1219,7 @@ impl Db {
         if embeddings.iter().any(|(_, _, _, e)| e.len() != dims) {
             return Err(Error::Config("embedding dimensions do not match".into()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.begin_immediate()?;
         validate_embedding_fingerprint_on_conn(&tx, fingerprint)?;
         ensure_vec_table_on_conn(&tx, dims)?;
         for (hash, seq, pos, embedding) in embeddings {
