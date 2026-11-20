@@ -159,7 +159,7 @@ impl std::fmt::Debug for Embedder {
 
 #[cfg(feature = "fastembed")]
 impl Embedder {
-    /// Create an embedder with the default model ([`AllMiniLML6V2`]).
+    /// Create an embedder with the default model ([`EmbeddingModel::AllMiniLML6V2`]).
     pub fn new() -> Result<Self> {
         Self::with_model(EmbeddingModel::AllMiniLML6V2)
     }

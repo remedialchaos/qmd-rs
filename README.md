@@ -131,7 +131,7 @@ All commands operate on a SQLite index database (default: `$XDG_DATA_HOME/qmd/in
 qmd --index ~/indexes/docs.sqlite status
 
 # Or via environment variable (ideal for per-agent or per-workspace routing)
-export QMD_INDEX=~/.gemini/antigravity-cli/qmd.sqlite
+export QMD_INDEX=~/.local/share/my-app/qmd.sqlite
 qmd status
 ```
 
@@ -163,6 +163,60 @@ qmd mcp
 - `search` — Fast BM25 keyword search
 - `vsearch` — Semantic vector similarity search
 - `status` — Index health, document counts, and collection statistics
+
+## Library Usage & Cargo Features
+
+`qmd-rs` can be embedded directly in Rust applications as a library without pulling in ONNX Runtime or an HTTP client.
+
+### Cargo features
+
+| Feature | Default | Description |
+| --- | --- | --- |
+| `fastembed-static` | Yes | Statically bundles ONNX Runtime (`fastembed`) for local embeddings and cross-encoder reranking. |
+| `fastembed-dynamic` | No | Loads `libonnxruntime.so` dynamically at runtime instead of bundling it. Mutually exclusive with `fastembed-static` (enabling both is rejected at compile time). |
+| `llm` | Yes | Built-in HTTP LLM query expansion (`ureq`) for Ollama, OpenAI-compatible, and Anthropic endpoints. |
+
+To embed the pure-Rust SQLite + FTS5 + `sqlite-vec` core with zero ONNX or HTTP dependencies:
+
+```toml
+[dependencies]
+qmd-rs = { version = "0.5", default-features = false }
+```
+
+Without a `fastembed-*` feature, BM25 (`search_fts`), direct ingestion, RRF fusion, and typed/heuristic query expansion work out of the box; vector indexing and semantic search require attaching a custom `EmbeddingEngine`, and hybrid search skips reranking cleanly when no `RerankingEngine` is attached. Without `llm`, `expand_query` falls back to heuristic expansion.
+
+### Opening indexes, direct records, and transactions
+
+```rust
+use std::time::Duration;
+use qmd_rs::{OpenOptions, Qmd};
+
+// Open with explicit busy timeout (WAL + BEGIN IMMEDIATE write transactions)
+let qmd = Qmd::open_with_options(
+    "./index.sqlite",
+    &OpenOptions::default().busy_timeout(Duration::from_secs(10)),
+)?;
+
+// Ingest non-filesystem records atomically in one transaction
+qmd.register_direct_collection("notes")?;
+qmd.write_batch(|batch| {
+    batch.upsert_record("notes", "a.md", "Alpha", "# Alpha\nsearchable body")?;
+    Ok(())
+})?;
+
+// Open strictly read-only (fails if missing; never migrates or writes)
+let ro = Qmd::open_read_only("./index.sqlite")?;
+let hits = ro.search_fts("searchable", 10)?;
+```
+
+You can also open a query-only handle after migration with `OpenOptions::default().query_only(true)`.
+
+### Pluggable engines and model lifecycle
+
+- Implement [`EmbeddingEngine`](qmd-rs/src/embed.rs) and attach it via `Qmd::with_embedder` / `Qmd::set_embedder`. Override `model_id()` and `dimensions()` to bind the index to a custom embedding contract; mismatched indexes are rejected rather than silently mixed.
+- Implement [`RerankingEngine`](qmd-rs/src/rerank.rs) and attach it via `Qmd::with_reranker` / `Qmd::set_reranker`.
+- Validate custom-contract indexes read-only with `embedding_fingerprint_for(...)` and `Qmd::doctor_with_fingerprint(path, &fingerprint, dims)`.
+- Long-lived processes can release model memory while keeping the SQLite handle open via `unload_embedder()`, `unload_reranker()`, or `unload_models()`, and inspect state with `is_embedder_loaded()` / `is_reranker_loaded()`.
 
 ## Retrieval-quality regression gate
 
