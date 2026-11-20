@@ -2582,7 +2582,7 @@ mod tests {
                 &[("hash", 0, 0, vec![0.0; 3]), ("hash", 1, 1, vec![0.0; 2])],
             )
             .unwrap_err();
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
         assert_eq!(db.embedding_fingerprint().unwrap(), None);
         assert_eq!(db.vector_count().unwrap(), 0);
     }

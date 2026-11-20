@@ -1567,7 +1567,7 @@ mod tests {
         assert_eq!(result.indexed, 1);
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].path.ends_with("bad.md"));
-        assert!(!result.failures[0].reason.is_empty());
+        assert_ne!(result.failures[0].reason, "");
         assert_eq!(qmd.doc_count().unwrap(), 1);
         fs::remove_dir_all(root).unwrap();
     }
