@@ -2,11 +2,18 @@
 //!
 //! Provides automated query expansion into lexical (`lex:`), semantic vector (`vec:`),
 //! and hypothetical document embedding (`hyde:`) variants to maximize retrieval recall.
+//!
+//! The HTTP provider calls are compiled only with the `llm` feature (which
+//! enables `ureq`). Typed-prefix input parsing and heuristic/simple expansion
+//! are always available; without `llm`, a configured provider degrades to
+//! the heuristic path.
 
+#[cfg(feature = "llm")]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "llm")]
 use crate::error::{Error, Result};
 use crate::search::Query;
 
@@ -30,6 +37,9 @@ pub enum LlmProvider {
 impl std::str::FromStr for LlmProvider {
     type Err = std::convert::Infallible;
 
+    // The qualification avoids the crate `Result` alias imported for the
+    // `llm`-gated HTTP adapters; without that feature it is redundant.
+    #[cfg_attr(not(feature = "llm"), allow(unused_qualifications))]
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "ollama" => Ok(Self::Ollama),
@@ -137,6 +147,10 @@ Requirements:
 - Output ONLY the prefixed lines.";
 
 /// Expand a query using the configured LLM provider, falling back to simple expansion on failure.
+///
+/// Without the `llm` feature the HTTP adapters are not compiled; a
+/// configured provider then degrades to the same simple expansion used when
+/// a provider request fails.
 #[must_use]
 pub fn expand_query(query: &str, config: Option<&LlmConfig>) -> Vec<Query> {
     let Some(cfg) = config else {
@@ -147,9 +161,17 @@ pub fn expand_query(query: &str, config: Option<&LlmConfig>) -> Vec<Query> {
         return Query::expand_simple(query);
     }
 
-    match call_provider(query, cfg) {
-        Ok(raw_output) => Query::from_llm_output(&raw_output, query),
-        Err(_) => Query::expand_simple(query),
+    #[cfg(feature = "llm")]
+    {
+        match call_provider(query, cfg) {
+            Ok(raw_output) => Query::from_llm_output(&raw_output, query),
+            Err(_) => Query::expand_simple(query),
+        }
+    }
+
+    #[cfg(not(feature = "llm"))]
+    {
+        Query::expand_simple(query)
     }
 }
 
@@ -182,6 +204,7 @@ pub fn parse_or_expand_query(input: &str, config: Option<&LlmConfig>) -> Vec<Que
 }
 
 /// Send request to the designated provider.
+#[cfg(feature = "llm")]
 fn call_provider(query: &str, config: &LlmConfig) -> Result<String> {
     let timeout = Duration::from_millis(config.timeout_ms);
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
@@ -195,6 +218,7 @@ fn call_provider(query: &str, config: &LlmConfig) -> Result<String> {
 }
 
 /// Query expansion via Ollama `/api/chat`.
+#[cfg(feature = "llm")]
 fn call_ollama(agent: &ureq::Agent, query: &str, config: &LlmConfig) -> Result<String> {
     let base_url = config.url.trim_end_matches('/');
     let endpoint = format!("{base_url}/api/chat");
@@ -225,6 +249,7 @@ fn call_ollama(agent: &ureq::Agent, query: &str, config: &LlmConfig) -> Result<S
 }
 
 /// Query expansion via OpenAI-compatible `/chat/completions`.
+#[cfg(feature = "llm")]
 fn call_openai(agent: &ureq::Agent, query: &str, config: &LlmConfig) -> Result<String> {
     let base_url = config.url.trim_end_matches('/');
     let endpoint = if base_url.ends_with("/v1") {
@@ -267,6 +292,7 @@ fn call_openai(agent: &ureq::Agent, query: &str, config: &LlmConfig) -> Result<S
 }
 
 /// Query expansion via Anthropic Messages API.
+#[cfg(feature = "llm")]
 fn call_anthropic(agent: &ureq::Agent, query: &str, config: &LlmConfig) -> Result<String> {
     let base_url = config.url.trim_end_matches('/');
     let endpoint = if base_url.ends_with("/v1") {
@@ -350,5 +376,29 @@ mod tests {
     fn llm_config_defaults_to_none() {
         let config = LlmConfig::default();
         assert_eq!(config.provider, LlmProvider::None);
+    }
+
+    #[cfg(not(feature = "llm"))]
+    #[test]
+    fn configured_provider_falls_back_to_heuristic_without_llm() {
+        // Without the llm feature there is no HTTP adapter to call; a
+        // configured provider must degrade to heuristic expansion instead of
+        // erroring or silently doing nothing.
+        let config = LlmConfig {
+            provider: LlmProvider::Ollama,
+            model: "llama3.2".into(),
+            url: "http://127.0.0.1:11434".into(),
+            api_key: None,
+            timeout_ms: 5000,
+        };
+        let queries = expand_query("rust ownership", Some(&config));
+        let baseline = expand_query("rust ownership", None);
+        assert_eq!(queries.len(), baseline.len());
+        assert_eq!(queries[0].text, "rust ownership");
+
+        // Typed-prefix parsing is unaffected by the missing feature.
+        let typed = parse_or_expand_query("lex: auth\nvec: tokens", Some(&config));
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed[0].kind, crate::search::QueryType::Lex);
     }
 }

@@ -15,7 +15,7 @@ name = "qmd_rs"
 path = "src/lib.rs"
 
 [dependencies]
-fastembed.workspace = true
+fastembed = { workspace = true, optional = true }
 globset.workspace = true
 ignore.workspace = true
 regex.workspace = true
@@ -25,8 +25,33 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlite-vec.workspace = true
 thiserror.workspace = true
-ureq.workspace = true
+ureq = { workspace = true, optional = true }
 zerocopy.workspace = true
+
+[features]
+# Existing standalone-CLI behavior: statically bundled ONNX Runtime plus the
+# built-in HTTP LLM query expansion.
+default = ["fastembed-static", "llm"]
+# Internal marker: a fastembed backend is available. Enabled by either
+# `fastembed-static` or `fastembed-dynamic`.
+fastembed = ["dep:fastembed"]
+# Statically bundle ONNX Runtime into the binary (self-contained CLI).
+fastembed-static = [
+    "fastembed",
+    "fastembed/ort-download-binaries-rustls-tls",
+    "fastembed/hf-hub-rustls-tls",
+]
+# Load `libonnxruntime.so` at runtime instead of bundling it, for smaller
+# host binaries that provide the library themselves.
+fastembed-dynamic = [
+    "fastembed",
+    "fastembed/ort-load-dynamic",
+    "fastembed/hf-hub-rustls-tls",
+]
+# Built-in HTTP LLM query expansion via ureq (Ollama, OpenAI-compatible,
+# Anthropic). Typed-prefix input and heuristic expansion stay available
+# without it.
+llm = ["dep:ureq"]
 
 [lints]
 workspace = true

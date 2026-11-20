@@ -1,8 +1,15 @@
-//! Reranking engine backed by [`fastembed`].
+//! Reranking engine seam.
+//!
+//! [`RerankingEngine`] and [`Scored`] are always available. The concrete
+//! fastembed-backed `Reranker` is compiled only when a `fastembed-*` feature
+//! is enabled.
 
+#[cfg(feature = "fastembed")]
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 
-use crate::error::{Error, Result};
+#[cfg(feature = "fastembed")]
+use crate::error::Error;
+use crate::error::Result;
 
 /// Scored rerank result.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -16,8 +23,9 @@ pub struct Scored {
 
 /// Narrow engine seam for reranking work.
 ///
-/// Production uses [`Reranker`]; the trait lets downstream callers plug in an
-/// API-based cross-encoder or a deterministic test double without pulling in
+/// Production uses the built-in fastembed cross-encoder (with a
+/// `fastembed-*` feature); the trait lets downstream callers plug in an
+/// API-based reranker or a deterministic test double without pulling in
 /// ONNX models.
 pub trait RerankingEngine: Send {
     /// Rerank documents by relevance to `query`, returning up to `limit`
@@ -26,23 +34,27 @@ pub trait RerankingEngine: Send {
 }
 
 /// Cross-encoder reranking engine.
+#[cfg(feature = "fastembed")]
 pub struct Reranker {
     /// Underlying fastembed model.
     model: TextRerank,
 }
 
+#[cfg(feature = "fastembed")]
 impl std::fmt::Debug for Reranker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reranker").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl RerankingEngine for Reranker {
     fn rerank(&mut self, query: &str, documents: &[&str], limit: usize) -> Result<Vec<Scored>> {
         Self::rerank(self, query, documents, limit)
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl Reranker {
     /// Create a reranker with the default model.
     pub fn new() -> Result<Self> {

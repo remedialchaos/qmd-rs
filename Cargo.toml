@@ -14,7 +14,9 @@ qmd-rs = { version = "0.5", path = "qmd-rs" }
 
 clap = { version = "4.6.0", features = ["derive", "env"] }
 # Keep TLS in the Rust dependency graph rather than linking to system OpenSSL.
-fastembed = { version = "5.13", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
+# ONNX Runtime linking strategy and model-download TLS are selected by the
+# `qmd-rs` crate's `fastembed-static` / `fastembed-dynamic` features.
+fastembed = { version = "5.13", default-features = false }
 globset = "0.4"
 ignore = "0.4"
 regex = "1.12.3"

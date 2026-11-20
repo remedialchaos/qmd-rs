@@ -1,19 +1,27 @@
-//! Embedding engine backed by [`fastembed`].
+//! Embedding contract and engine seam.
+//!
+//! [`EmbeddingEngine`] and the fingerprint helpers are always available. The
+//! concrete fastembed-backed `Embedder` is compiled only when a
+//! `fastembed-*` feature is enabled.
 
+#[cfg(feature = "fastembed")]
 use fastembed::{EmbeddingModel, InitOptions, ModelTrait, TextEmbedding};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{Chunker, DEFAULT_CHUNK_CHARS, DEFAULT_OVERLAP_CHARS};
 
-use crate::error::{Error, Result};
+#[cfg(feature = "fastembed")]
+use crate::error::Error;
+use crate::error::Result;
 
 /// Upper bound for the number of chunks embedded in one ONNX Runtime call.
+#[cfg(feature = "fastembed")]
 const EMBEDDING_BATCH_SIZE: usize = 16;
 
 /// Stable fingerprint format for the embedding/index contract.
 pub const FINGERPRINT_FORMAT: &str = "qmd-embedding-v1";
 
-/// Identifier of the default embedding model ([`Embedder::new`]).
+/// Identifier of the default embedding model (fastembed's `AllMiniLML6V2`).
 ///
 /// Engines that do not override [`EmbeddingEngine::model_id`] report this
 /// value, so their vectors share the historical embedding contract.
@@ -66,6 +74,7 @@ pub fn default_embedding_fingerprint_with_chunker(dims: usize, chunker: Chunker)
 }
 
 /// Return contiguous ranges that limit a document embedding request to safe batches.
+#[cfg(feature = "fastembed")]
 fn batch_ranges(len: usize) -> Vec<std::ops::Range<usize>> {
     (0..len)
         .step_by(EMBEDDING_BATCH_SIZE)
@@ -75,17 +84,19 @@ fn batch_ranges(len: usize) -> Vec<std::ops::Range<usize>> {
 
 /// Narrow engine seam for embedding work.
 ///
-/// Production uses [`Embedder`]; the trait exists so embedding scheduling and
-/// failure handling can be exercised deterministically without loading an ONNX
-/// model or touching the network.
+/// Production uses the built-in fastembed engine (with a `fastembed-*`
+/// feature); the trait exists so embedding scheduling and failure handling
+/// can be exercised deterministically without loading an ONNX model or
+/// touching the network, and so downstream callers can plug in their own
+/// model or an API embedder.
 ///
 /// # Default contract
 ///
 /// Implementations that do not override [`EmbeddingEngine::model_id`] and
 /// [`EmbeddingEngine::dimensions`] inherit the historical default contract
 /// ([`DEFAULT_MODEL_ID`] / [`DEFAULT_EMBEDDING_DIMS`]), so they stay compatible
-/// with indexes embedded by the default [`Embedder`]. Override both to plug in
-/// a different model: the derived fingerprint then changes, and indexes
+/// with indexes embedded by the default built-in engine. Override both to plug
+/// in a different model: the derived fingerprint then changes, and indexes
 /// embedded under the old contract are rejected instead of mixed.
 pub trait EmbeddingEngine: Send {
     /// Embed a single query string.
@@ -109,6 +120,7 @@ pub trait EmbeddingEngine: Send {
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl EmbeddingEngine for Embedder {
     fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
         Self::embed_query(self, query)
@@ -128,6 +140,7 @@ impl EmbeddingEngine for Embedder {
 }
 
 /// Text embedding engine.
+#[cfg(feature = "fastembed")]
 pub struct Embedder {
     /// Underlying fastembed model.
     model: TextEmbedding,
@@ -137,12 +150,14 @@ pub struct Embedder {
     dims: usize,
 }
 
+#[cfg(feature = "fastembed")]
 impl std::fmt::Debug for Embedder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Embedder").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl Embedder {
     /// Create an embedder with the default model ([`AllMiniLML6V2`]).
     pub fn new() -> Result<Self> {
@@ -198,10 +213,14 @@ impl Embedder {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CHUNK_CHARS, DEFAULT_MODEL_ID, DEFAULT_OVERLAP_CHARS, EMBEDDING_BATCH_SIZE,
-        batch_ranges, embedding_fingerprint, embedding_fingerprint_for,
+        DEFAULT_CHUNK_CHARS, DEFAULT_MODEL_ID, DEFAULT_OVERLAP_CHARS, embedding_fingerprint,
+        embedding_fingerprint_for,
     };
 
+    #[cfg(feature = "fastembed")]
+    use super::{EMBEDDING_BATCH_SIZE, batch_ranges};
+
+    #[cfg(feature = "fastembed")]
     #[test]
     fn batch_ranges_bound_embedding_work() {
         let ranges = batch_ranges(EMBEDDING_BATCH_SIZE + 1);
