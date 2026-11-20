@@ -405,7 +405,7 @@ const WRITE_LOCK_MAX_POLL: Duration = Duration::from_millis(2);
 /// the migration once.
 const SCHEMA_VERSION: &str = "2";
 
-/// Connection options for [`Db::open_with_options`].
+/// Connection options for [`Db::open_with_options`] and [`Qmd::open_with_options`](crate::Qmd::open_with_options).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct OpenOptions {

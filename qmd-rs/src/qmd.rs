@@ -21,7 +21,7 @@ use ignore::gitignore::GitignoreBuilder;
 use crate::chunk::Chunker;
 use crate::db::{
     Collection, CollectionInfo, Db, DoctorReport, Document, DocumentSummary, IndexStatus,
-    SearchResult, extract_title, hash_content,
+    OpenOptions, SearchResult, extract_title, hash_content,
 };
 #[cfg(feature = "fastembed")]
 use crate::embed::Embedder;
@@ -193,6 +193,36 @@ impl Qmd {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             db: Db::open(db_path.as_ref())?,
+            embedder: None,
+            reranker: None,
+            chunker: Chunker::default(),
+        })
+    }
+
+    /// Open (or create) a qmd index at the given SQLite path with explicit
+    /// connection options.
+    ///
+    /// Use [`OpenOptions::busy_timeout`] to tune lock contention waits or
+    /// [`OpenOptions::query_only`] to open an index that rejects writes after
+    /// applying connection pragmas and migrations.
+    pub fn open_with_options(db_path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
+        Ok(Self {
+            db: Db::open_with_options(db_path.as_ref(), options)?,
+            embedder: None,
+            reranker: None,
+            chunker: Chunker::default(),
+        })
+    }
+
+    /// Open an existing qmd index strictly read-only, without running
+    /// migrations or creating the database file.
+    ///
+    /// Fails if `db_path` does not exist. Read APIs (`search_fts`, `get`,
+    /// `status`, etc.) work normally; any write attempt returns a database
+    /// error.
+    pub fn open_read_only(db_path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            db: Db::open_read_only(db_path.as_ref())?,
             embedder: None,
             reranker: None,
             chunker: Chunker::default(),
@@ -1340,7 +1370,7 @@ mod tests {
     use crate::db::hash_content;
     use crate::db::{
         DoctorCheck, DoctorCheckStatus, DoctorReport, Document, EmbeddingCompatibility,
-        SearchResult, SearchSource,
+        OpenOptions, SearchResult, SearchSource,
     };
     use crate::embed::{EmbeddingEngine, embedding_fingerprint, embedding_fingerprint_for};
     use crate::error::{Error, Result};
@@ -2285,6 +2315,79 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_read_only_reads_existing_index_and_rejects_writes() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("qmd-open-read-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sqlite");
+
+        // Opening a missing index strictly read-only fails and does not create it.
+        assert!(Qmd::open_read_only(&path).is_err());
+        assert!(!path.exists());
+
+        {
+            let writer = Qmd::open(&path).unwrap();
+            writer
+                .upsert_record("notes", "a.md", "Alpha", "# Alpha\nreadonly lookup term")
+                .unwrap();
+        }
+
+        let ro = Qmd::open_read_only(&path).unwrap();
+        let hits = ro.search_fts("readonly lookup", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc.path, "a.md");
+        assert_eq!(
+            ro.get("notes/a.md").unwrap().body.as_deref(),
+            Some("# Alpha\nreadonly lookup term")
+        );
+
+        assert!(
+            ro.upsert_record("notes", "b.md", "Beta", "# Beta\nblocked write")
+                .is_err()
+        );
+        assert!(ro.get_record("notes", "b.md").unwrap().is_none());
+
+        drop(ro);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_with_options_query_only_reads_without_writing() {
+        use std::fs;
+        use std::time::Duration;
+        let dir =
+            std::env::temp_dir().join(format!("qmd-open-with-options-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sqlite");
+
+        {
+            let writer = Qmd::open(&path).unwrap();
+            writer
+                .upsert_record("notes", "a.md", "Alpha", "# Alpha\noptions lookup term")
+                .unwrap();
+        }
+
+        let opts = OpenOptions::default()
+            .busy_timeout(Duration::from_secs(2))
+            .query_only(true);
+        let qmd = Qmd::open_with_options(&path, &opts).unwrap();
+        let hits = qmd.search_fts("options lookup", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc.path, "a.md");
+
+        assert!(
+            qmd.upsert_record("notes", "b.md", "Beta", "# Beta\nblocked write")
+                .is_err()
+        );
+        assert!(qmd.get_record("notes", "b.md").unwrap().is_none());
+
+        drop(qmd);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(not(feature = "fastembed"))]
