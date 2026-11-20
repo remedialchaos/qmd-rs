@@ -1,7 +1,9 @@
 //! QMD — Query Markdown Documents.
 //!
-//! Local search engine for markdown files combining FTS5 (BM25),
-//! sqlite-vec (vector KNN), and fastembed (ONNX embeddings + reranking).
+//! Local search engine for markdown files combining FTS5 (BM25) and
+//! sqlite-vec (vector KNN) over a single local SQLite index, with ONNX
+//! embeddings and reranking via opt-in `fastembed-*` features or fully
+//! pluggable custom engines.
 //!
 //! # Quick start
 //!
@@ -20,6 +22,16 @@
 //! let fts_results = qmd.search_fts("rust ownership", 10)?;
 //! # Ok::<(), qmd_rs::Error>(())
 //! ```
+
+// The two fastembed backends select mutually exclusive ONNX Runtime
+// linking strategies; enabling both is never a meaningful build (ort would
+// link no runtime at all), so reject it up front instead of letting it
+// fail at first model use.
+#[cfg(all(feature = "fastembed-static", feature = "fastembed-dynamic"))]
+compile_error!(
+    "fastembed-static and fastembed-dynamic are mutually exclusive ONNX Runtime linking \
+     strategies; enable at most one of them"
+);
 
 pub mod chunk;
 pub mod db;

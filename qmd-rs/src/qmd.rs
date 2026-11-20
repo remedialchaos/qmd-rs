@@ -23,12 +23,16 @@ use crate::db::{
     Collection, CollectionInfo, Db, DoctorReport, Document, DocumentSummary, IndexStatus,
     SearchResult, extract_title, hash_content,
 };
+#[cfg(feature = "fastembed")]
+use crate::embed::Embedder;
 use crate::embed::{
-    DEFAULT_EMBEDDING_DIMS, DEFAULT_MODEL_ID, Embedder, EmbeddingEngine,
+    DEFAULT_EMBEDDING_DIMS, DEFAULT_MODEL_ID, EmbeddingEngine,
     default_embedding_fingerprint_with_chunker, embedding_fingerprint_for,
 };
 use crate::error::{Error, Result};
-use crate::rerank::{Reranker, RerankingEngine, Scored};
+#[cfg(feature = "fastembed")]
+use crate::rerank::Reranker;
+use crate::rerank::{RerankingEngine, Scored};
 use crate::search::{self, Query, QueryType};
 
 /// Writes available inside [`Qmd::write_batch`].
@@ -238,11 +242,28 @@ impl Qmd {
     }
 
     /// Ensure the embedder is loaded, lazily initializing on first call.
+    ///
+    /// Without a `fastembed-*` feature there is no built-in engine: callers
+    /// must attach one with [`Qmd::set_embedder`] (or
+    /// [`Qmd::with_embedder`]) before any embedding work, and this returns a
+    /// descriptive error otherwise.
+    #[cfg_attr(not(feature = "fastembed"), allow(clippy::needless_pass_by_ref_mut))]
     fn ensure_embedder(&mut self) -> Result<()> {
-        if self.embedder.is_none() {
-            self.embedder = Some(Box::new(Embedder::new()?));
+        if self.embedder.is_some() {
+            return Ok(());
         }
-        Ok(())
+        #[cfg(feature = "fastembed")]
+        {
+            self.embedder = Some(Box::new(Embedder::new()?));
+            Ok(())
+        }
+        #[cfg(not(feature = "fastembed"))]
+        {
+            Err(Error::Embedding(
+                "no embedder configured; enable a fastembed-* feature or provide a custom EmbeddingEngine"
+                    .into(),
+            ))
+        }
     }
 
     // ── Pluggable engines & model lifecycle ─────────────────────────────
@@ -965,10 +986,15 @@ impl Qmd {
     /// Apply cross-encoder reranking to top results.
     fn apply_reranking(&mut self, query: &str, results: &mut Vec<SearchResult>, limit: usize) {
         if self.reranker.is_none() {
+            // Without the fastembed backend no default engine can be built;
+            // keep the fused RRF order, matching the failure fallback.
+            #[cfg(feature = "fastembed")]
             match Reranker::new() {
                 Ok(r) => self.reranker = Some(Box::new(r)),
                 Err(_) => return,
             }
+            #[cfg(not(feature = "fastembed"))]
+            return;
         }
 
         let top_n = results.len().min(limit * 2);
@@ -2259,6 +2285,42 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn vector_search_without_fastembed_or_custom_engine_errors_clearly() {
+        let mut qmd = Qmd::open_memory().unwrap();
+
+        let err = qmd.search_vec("anything", 10).unwrap_err();
+        assert!(
+            matches!(err, Error::Embedding(ref m) if m.contains("no embedder configured")),
+            "{err:?}"
+        );
+
+        // Hybrid search hits the same guard on its embedding leg.
+        let hybrid_err = qmd.search("anything", 10).unwrap_err();
+        assert!(
+            matches!(hybrid_err, Error::Embedding(ref m) if m.contains("no embedder configured")),
+            "{hybrid_err:?}"
+        );
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn rerank_pass_is_skipped_cleanly_without_a_reranking_engine() {
+        // A custom embedder is attached, but no reranking engine: the
+        // rerank=true pass must degrade to fused RRF order, not error.
+        let mut qmd = Qmd::open_memory().unwrap();
+        qmd.set_embedder(Box::new(FakeEngine::new(None)));
+        seed_embed_doc(&qmd, "a.md", "alpha alpha keyword");
+        seed_embed_doc(&qmd, "b.md", "alpha keyword other");
+
+        let results = qmd
+            .search_with_queries_options("alpha", &Query::expand_simple("alpha"), 10, 0, None, true)
+            .unwrap();
+
+        assert_eq!(paths(&results), ["a.md", "b.md"]);
     }
 }
 
