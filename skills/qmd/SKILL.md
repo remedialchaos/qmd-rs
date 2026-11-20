@@ -6,7 +6,7 @@ compatibility: Requires native Rust `qmd` CLI (qmd-rs). Available at `~/.local/b
 metadata:
   author: tobi
   adapted-by: remedialchaos (qmd-rs)
-  version: "0.5.0"
+  version: "0.6.0"
 allowed-tools: Bash(qmd:*)
 ---
 
