@@ -14,6 +14,17 @@ pub struct Scored {
     pub score: f32,
 }
 
+/// Narrow engine seam for reranking work.
+///
+/// Production uses [`Reranker`]; the trait lets downstream callers plug in an
+/// API-based cross-encoder or a deterministic test double without pulling in
+/// ONNX models.
+pub trait RerankingEngine: Send {
+    /// Rerank documents by relevance to `query`, returning up to `limit`
+    /// scored indices sorted by descending relevance.
+    fn rerank(&mut self, query: &str, documents: &[&str], limit: usize) -> Result<Vec<Scored>>;
+}
+
 /// Cross-encoder reranking engine.
 pub struct Reranker {
     /// Underlying fastembed model.
@@ -23,6 +34,12 @@ pub struct Reranker {
 impl std::fmt::Debug for Reranker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reranker").finish_non_exhaustive()
+    }
+}
+
+impl RerankingEngine for Reranker {
+    fn rerank(&mut self, query: &str, documents: &[&str], limit: usize) -> Result<Vec<Scored>> {
+        Self::rerank(self, query, documents, limit)
     }
 }
 

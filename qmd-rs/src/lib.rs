@@ -35,10 +35,12 @@ pub use db::{
     DocumentSummary, EmbeddingCompatibility, IndexStatus, OpenOptions, SearchResult, SearchSource,
     hash_content,
 };
+pub use embed::{EmbeddingEngine, embedding_fingerprint_for};
 pub use error::{Error, Result};
 pub use llm::{LlmConfig, LlmProvider, expand_query, parse_or_expand_query};
 pub use qmd::{
     EmbedResult, IndexFailure, IndexResult, MultiGetItem, Qmd, UpdateResult, WriteBatch,
     parse_path_range, slice_body,
 };
+pub use rerank::{RerankingEngine, Scored};
 pub use search::{Query, QueryType};

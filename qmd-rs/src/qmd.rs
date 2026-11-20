@@ -23,9 +23,12 @@ use crate::db::{
     Collection, CollectionInfo, Db, DoctorReport, Document, DocumentSummary, IndexStatus,
     SearchResult, extract_title, hash_content,
 };
-use crate::embed::{Embedder, EmbeddingEngine, default_embedding_fingerprint_with_chunker};
+use crate::embed::{
+    DEFAULT_EMBEDDING_DIMS, DEFAULT_MODEL_ID, Embedder, EmbeddingEngine,
+    default_embedding_fingerprint_with_chunker, embedding_fingerprint_for,
+};
 use crate::error::{Error, Result};
-use crate::rerank::{Reranker, Scored};
+use crate::rerank::{Reranker, RerankingEngine, Scored};
 use crate::search::{self, Query, QueryType};
 
 /// Writes available inside [`Qmd::write_batch`].
@@ -82,7 +85,7 @@ pub struct Qmd {
     /// Lazily-loaded embedding engine.
     embedder: Option<Box<dyn EmbeddingEngine>>,
     /// Lazily-loaded reranking engine.
-    reranker: Option<Reranker>,
+    reranker: Option<Box<dyn RerankingEngine>>,
     /// Document chunker for embedding.
     chunker: Chunker,
 }
@@ -214,8 +217,24 @@ impl Qmd {
     }
 
     /// Return the fingerprint for this Qmd handle's active embedding contract.
+    ///
+    /// Derived from the attached embedder's [`EmbeddingEngine::model_id`] and
+    /// [`EmbeddingEngine::dimensions`] when one is set, falling back to the
+    /// default contract ([`DEFAULT_MODEL_ID`] / [`DEFAULT_EMBEDDING_DIMS`])
+    /// otherwise — identical to the historical fingerprint.
     fn current_embedding_fingerprint(&self) -> String {
-        default_embedding_fingerprint_with_chunker(384, self.chunker)
+        let (model_id, dims) = self
+            .embedder
+            .as_ref()
+            .map_or((DEFAULT_MODEL_ID, DEFAULT_EMBEDDING_DIMS), |engine| {
+                (engine.model_id(), engine.dimensions())
+            });
+        embedding_fingerprint_for(
+            model_id,
+            dims,
+            self.chunker.max_chars,
+            self.chunker.overlap_chars,
+        )
     }
 
     /// Ensure the embedder is loaded, lazily initializing on first call.
@@ -224,6 +243,84 @@ impl Qmd {
             self.embedder = Some(Box::new(Embedder::new()?));
         }
         Ok(())
+    }
+
+    // ── Pluggable engines & model lifecycle ─────────────────────────────
+
+    /// Attach a custom embedding engine, returning the handle for chaining.
+    ///
+    /// The active embedding-contract fingerprint changes with the engine's
+    /// [`EmbeddingEngine::model_id`] and [`EmbeddingEngine::dimensions`];
+    /// indexes embedded under a different contract are rejected by embedding
+    /// and vector search until a matching engine is (re-)attached.
+    #[must_use]
+    pub fn with_embedder(mut self, engine: Box<dyn EmbeddingEngine>) -> Self {
+        self.embedder = Some(engine);
+        self
+    }
+
+    /// Replace the embedding engine. See [`Qmd::with_embedder`].
+    pub fn set_embedder(&mut self, engine: Box<dyn EmbeddingEngine>) {
+        self.embedder = Some(engine);
+    }
+
+    /// Attach a custom reranking engine, returning the handle for chaining.
+    #[must_use]
+    pub fn with_reranker(mut self, engine: Box<dyn RerankingEngine>) -> Self {
+        self.reranker = Some(engine);
+        self
+    }
+
+    /// Replace the reranking engine. See [`Qmd::with_reranker`].
+    pub fn set_reranker(&mut self, engine: Box<dyn RerankingEngine>) {
+        self.reranker = Some(engine);
+    }
+
+    /// Whether an embedding engine is currently attached.
+    #[must_use]
+    pub fn is_embedder_loaded(&self) -> bool {
+        self.embedder.is_some()
+    }
+
+    /// Whether a reranking engine is currently attached.
+    #[must_use]
+    pub fn is_reranker_loaded(&self) -> bool {
+        self.reranker.is_some()
+    }
+
+    /// Drop the embedding engine, releasing its model memory.
+    ///
+    /// With the default `fastembed` build the built-in model lazily
+    /// re-initializes on the next embedding call. A custom engine is gone for
+    /// good: re-attach one with [`Qmd::set_embedder`] before the next
+    /// embedding call, or that call will fall back to (or error without) the
+    /// built-in engine.
+    pub fn unload_embedder(&mut self) {
+        self.embedder = None;
+    }
+
+    /// Drop the reranking engine, releasing its model memory.
+    ///
+    /// With the default `fastembed` build the built-in model lazily
+    /// re-initializes on the next reranking pass; a custom engine must be
+    /// re-attached with [`Qmd::set_reranker`] to be used again.
+    pub fn unload_reranker(&mut self) {
+        self.reranker = None;
+    }
+
+    /// Drop both model engines, keeping the database handle and chunker.
+    ///
+    /// Intended for long-lived processes that want to release model memory
+    /// after an idle window without closing the index. On the next embedding
+    /// or reranking call the built-in models lazily re-initialize (with the
+    /// default `fastembed` build); custom engines are dropped and must be
+    /// re-attached. After unloading, the handle reports the default embedding
+    /// contract again: an index embedded under a custom contract will fail
+    /// fingerprint validation until a matching engine is re-attached, rather
+    /// than silently querying vectors under the wrong contract.
+    pub fn unload_models(&mut self) {
+        self.embedder = None;
+        self.reranker = None;
     }
 
     // ── Collection management ───────────────────────────────────────────
@@ -869,7 +966,7 @@ impl Qmd {
     fn apply_reranking(&mut self, query: &str, results: &mut Vec<SearchResult>, limit: usize) {
         if self.reranker.is_none() {
             match Reranker::new() {
-                Ok(r) => self.reranker = Some(r),
+                Ok(r) => self.reranker = Some(Box::new(r)),
                 Err(_) => return,
             }
         }
@@ -1026,10 +1123,28 @@ impl Qmd {
     }
 
     /// Diagnose an existing index through a strictly read-only connection.
+    ///
+    /// Validates against the default embedding contract
+    /// ([`DEFAULT_MODEL_ID`] / [`DEFAULT_EMBEDDING_DIMS`]).
     pub fn doctor(db_path: impl AsRef<Path>) -> Result<DoctorReport> {
+        let fingerprint =
+            default_embedding_fingerprint_with_chunker(DEFAULT_EMBEDDING_DIMS, Chunker::default());
+        Self::doctor_with_fingerprint(db_path, &fingerprint, DEFAULT_EMBEDDING_DIMS)
+    }
+
+    /// Diagnose an existing index against a caller-supplied contract.
+    ///
+    /// For indexes embedded by a custom engine, pass the contract
+    /// fingerprint (e.g. [`crate::embed::embedding_fingerprint_for`] with the
+    /// engine's model id, dimensions, and chunker limits) and the engine's
+    /// vector width, so compatibility checks do not report false mismatches.
+    pub fn doctor_with_fingerprint(
+        db_path: impl AsRef<Path>,
+        expected_fingerprint: &str,
+        expected_dims: usize,
+    ) -> Result<DoctorReport> {
         let db = Db::open_read_only(db_path.as_ref())?;
-        let fingerprint = default_embedding_fingerprint_with_chunker(384, Chunker::default());
-        db.doctor(&fingerprint, 384)
+        db.doctor(expected_fingerprint, expected_dims)
     }
 
     /// Count active documents.
@@ -1194,13 +1309,17 @@ fn collect_results(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{DEFAULT_EMBED_GROUP_SIZE, Qmd, reranked_results};
-    use crate::chunk::Chunker;
+    use crate::chunk::{Chunker, DEFAULT_CHUNK_CHARS, DEFAULT_OVERLAP_CHARS};
     use crate::db::Collection;
     use crate::db::hash_content;
-    use crate::db::{Document, SearchResult, SearchSource};
-    use crate::embed::{EmbeddingEngine, embedding_fingerprint};
+    use crate::db::{
+        DoctorCheck, DoctorCheckStatus, DoctorReport, Document, EmbeddingCompatibility,
+        SearchResult, SearchSource,
+    };
+    use crate::embed::{EmbeddingEngine, embedding_fingerprint, embedding_fingerprint_for};
     use crate::error::{Error, Result};
-    use crate::rerank::Scored;
+    use crate::rerank::{RerankingEngine, Scored};
+    use crate::search::Query;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1892,6 +2011,254 @@ mod tests {
 
         let multi_csv = qmd.multi_get("docs/a.md, docs/sub/b.md", 100_000).unwrap();
         assert_eq!(multi_csv.len(), 2);
+    }
+
+    /// Deterministic reranking double: snippets containing `marker` rank first.
+    struct MarkerReranker {
+        marker: &'static str,
+    }
+
+    impl RerankingEngine for MarkerReranker {
+        fn rerank(
+            &mut self,
+            _query: &str,
+            documents: &[&str],
+            limit: usize,
+        ) -> Result<Vec<Scored>> {
+            let mut scored: Vec<Scored> = documents
+                .iter()
+                .enumerate()
+                .map(|(i, d)| Scored {
+                    index: i,
+                    score: if d.contains(self.marker) { 2.0 } else { 0.5 },
+                })
+                .collect();
+            scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+            scored.truncate(limit);
+            Ok(scored)
+        }
+    }
+
+    /// Deterministic embedding double with an explicit, non-default contract.
+    struct ContractEngine {
+        model_id: String,
+        dims: usize,
+    }
+
+    impl EmbeddingEngine for ContractEngine {
+        fn embed_query(&mut self, _query: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.5; self.dims])
+        }
+
+        fn embed_documents(&mut self, docs: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.5; self.dims]; docs.len()])
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+    }
+
+    #[test]
+    fn custom_embedder_drives_contract_fingerprint_and_vector_width() {
+        let mut qmd = Qmd::open_memory()
+            .unwrap()
+            .with_embedder(Box::new(ContractEngine {
+                model_id: "custom-test-model".into(),
+                dims: 16,
+            }))
+            .with_reranker(Box::new(MarkerReranker { marker: "PRIORITY" }));
+        seed_embed_doc(&qmd, "a.md", "# A\nalpha keyword content");
+        seed_embed_doc(&qmd, "b.md", "# B\nbeta keyword content");
+        seed_embed_doc(&qmd, "c.md", "# C\ngamma keyword content");
+
+        let result = qmd.embed().unwrap();
+        assert_eq!(result.failures, 0);
+        assert_eq!(result.embedded, 3);
+
+        // The stored fingerprint must be derived from the attached engine's
+        // model id and dimensions, not the historical defaults.
+        let expected = embedding_fingerprint_for(
+            "custom-test-model",
+            16,
+            DEFAULT_CHUNK_CHARS,
+            DEFAULT_OVERLAP_CHARS,
+        );
+        assert_eq!(
+            qmd.db()
+                .cfg_get("embedding_fingerprint")
+                .unwrap()
+                .as_deref(),
+            Some(expected.as_str())
+        );
+        let status = qmd.status().unwrap();
+        assert_eq!(
+            status.embedding_compatibility,
+            EmbeddingCompatibility::Compatible
+        );
+
+        // Vector search runs end to end: a width mismatch between the engine
+        // and the stored vec0 table would make this KNN call fail.
+        let hits = qmd.search_vec("keyword", 10).unwrap();
+        assert_eq!(hits.len(), 3);
+
+        // Hybrid search still works through the attached engines.
+        let results = qmd.search("keyword", 10).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Switching to a different model identity on the same index must be
+        // rejected with the expected fingerprint mismatch, not silently mixed.
+        qmd.set_embedder(Box::new(ContractEngine {
+            model_id: "other-model".into(),
+            dims: 16,
+        }));
+        let model_switch_err = qmd.search_vec("keyword", 10).unwrap_err();
+        assert!(
+            matches!(model_switch_err, Error::Config(ref m) if m.contains("fingerprint mismatch")),
+            "{model_switch_err:?}"
+        );
+        assert_eq!(
+            qmd.status().unwrap().embedding_compatibility,
+            EmbeddingCompatibility::Mismatched
+        );
+
+        // Same model id but different dimensions is a different contract too.
+        qmd.set_embedder(Box::new(ContractEngine {
+            model_id: "custom-test-model".into(),
+            dims: 32,
+        }));
+        let dims_switch_err = qmd.embed().unwrap_err();
+        assert!(
+            matches!(dims_switch_err, Error::Config(ref m) if m.contains("fingerprint mismatch")),
+            "{dims_switch_err:?}"
+        );
+    }
+
+    #[test]
+    fn custom_reranker_reorders_hybrid_results() {
+        let mut qmd = Qmd::open_memory()
+            .unwrap()
+            .with_embedder(Box::new(FakeEngine::new(None)))
+            .with_reranker(Box::new(MarkerReranker { marker: "PRIORITY" }));
+        // BM25 ranks a.md first (more query terms); the custom reranker must
+        // be able to move b.md above it via its marker rule.
+        seed_embed_doc(&qmd, "a.md", "alpha alpha alpha body of doc a");
+        seed_embed_doc(&qmd, "b.md", "alpha PRIORITY body of doc b");
+        seed_embed_doc(&qmd, "z.md", "completely unrelated body text");
+
+        let rerank_off = qmd
+            .search_with_queries_options(
+                "alpha",
+                &Query::expand_simple("alpha"),
+                10,
+                0,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(paths(&rerank_off).first().copied(), Some("a.md"));
+
+        let results = qmd.search("alpha", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc.path, "b.md");
+        assert_eq!(results[1].doc.path, "a.md");
+    }
+
+    #[test]
+    fn engine_lifecycle_unload_keeps_db_reads_working() {
+        let mut qmd = Qmd::open_memory()
+            .unwrap()
+            .with_embedder(Box::new(FakeEngine::new(None)))
+            .with_reranker(Box::new(MarkerReranker { marker: "PRIORITY" }));
+        seed_embed_doc(&qmd, "a.md", "# A\nlifecycle keyword content");
+        seed_embed_doc(&qmd, "b.md", "# B\nother keyword content");
+        qmd.embed().unwrap();
+
+        assert!(qmd.is_embedder_loaded());
+        assert!(qmd.is_reranker_loaded());
+
+        qmd.unload_embedder();
+        assert!(!qmd.is_embedder_loaded());
+        assert!(qmd.is_reranker_loaded());
+
+        qmd.unload_reranker();
+        assert!(!qmd.is_reranker_loaded());
+
+        // Re-attach, then drop both engines in one call.
+        qmd.set_embedder(Box::new(FakeEngine::new(None)));
+        qmd.set_reranker(Box::new(MarkerReranker { marker: "PRIORITY" }));
+        qmd.unload_models();
+        assert!(!qmd.is_embedder_loaded());
+        assert!(!qmd.is_reranker_loaded());
+
+        // The database handle survives: reads keep working without engines.
+        assert_eq!(qmd.search_fts("lifecycle", 10).unwrap().len(), 1);
+        let doc = qmd.get("docs/a.md").unwrap();
+        assert_eq!(doc.body.as_deref(), Some("# A\nlifecycle keyword content"));
+    }
+
+    fn doctor_check<'a>(report: &'a DoctorReport, name: &str) -> &'a DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .expect("doctor report should include the check")
+    }
+
+    #[test]
+    fn doctor_with_fingerprint_validates_custom_contract_indexes() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "qmd-doctor-custom-contract-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        {
+            let mut qmd = Qmd::open(&path)
+                .unwrap()
+                .with_embedder(Box::new(ContractEngine {
+                    model_id: "custom-test-model".into(),
+                    dims: 16,
+                }));
+            seed_embed_doc(&qmd, "a.md", "# A\ndoctor keyword content");
+            qmd.embed().unwrap();
+        }
+
+        let expected = embedding_fingerprint_for(
+            "custom-test-model",
+            16,
+            DEFAULT_CHUNK_CHARS,
+            DEFAULT_OVERLAP_CHARS,
+        );
+
+        // The plain doctor assumes the default contract: for this index it
+        // must report both a fingerprint and a dimension mismatch.
+        let default_report = Qmd::doctor(&path).unwrap();
+        assert_eq!(
+            doctor_check(&default_report, "embedding_fingerprint").status,
+            DoctorCheckStatus::Error
+        );
+        assert_eq!(
+            doctor_check(&default_report, "vector_dimensions").status,
+            DoctorCheckStatus::Error
+        );
+
+        // The overload accepts the custom contract: no false mismatches.
+        let custom_report = Qmd::doctor_with_fingerprint(&path, &expected, 16).unwrap();
+        assert_eq!(
+            doctor_check(&custom_report, "embedding_fingerprint").status,
+            DoctorCheckStatus::Ok
+        );
+        assert_eq!(
+            doctor_check(&custom_report, "vector_dimensions").status,
+            DoctorCheckStatus::Ok
+        );
+
+        fs::remove_file(path).unwrap();
     }
 }
 
